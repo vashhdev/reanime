@@ -127,6 +127,8 @@ Every push and pull request runs the [CI pipeline](.github/workflows/ci.yml) in 
 
 The pipeline also runs daily, so if reanime changes something, the **live** stage fails.
 
+Merging into `main` needs the **all checks passed** job, which is green only when stages 1 to 4 are. The live and Termux checks are advisory, so a site outage doesn't block merges.
+
 To release: bump `__version__` in `reanime.py` and `version` in `pyproject.toml`, add a CHANGELOG section, then `git tag v1.1.0 && git push --tags`.
 
 ## Disclaimer

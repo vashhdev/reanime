@@ -3,6 +3,8 @@
 #   1 lint -> 2 test -> 3 build -> 4 install -> 6 release (tags only)
 #                    \-> 5 live site check
 #
+# "all checks passed" sums up 1-4 and is the check branch protection requires.
+#
 # runs on every push and pull request, daily (to catch reanime/flixcloud changes and
 # runner image drift), on demand from the Actions tab, and on v* tags to release.
 name: CI
@@ -126,6 +128,23 @@ jobs:
           $mpv = $ready -replace '^ready: ', ''
           & $mpv --vo=null --ao=null --frames=10 av://lavfi:testsrc=duration=1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+  ok:
+    # the one check branch protection requires, so matrix renames don't break it.
+    # runs even when a stage fails (a skipped required check would count as passing)
+    # and is green only if every required stage is. live and termux stay advisory:
+    # a site outage or a termux image change shouldn't block merges.
+    name: all checks passed
+    if: ${{ !cancelled() }}
+    needs: [lint, test, build, install]
+    runs-on: ubuntu-latest
+    steps:
+      - name: required stages
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "lint test build install: $RESULTS"
+          for r in $RESULTS; do test "$r" = success; done
 
   install-termux:
     # Termux userland in Docker: covers the installer's Termux branch (pkg + pip) and
