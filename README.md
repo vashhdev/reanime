@@ -1,5 +1,7 @@
 # reanime
 
+[![CI](https://github.com/vashhdev/reanime/actions/workflows/ci.yml/badge.svg)](https://github.com/vashhdev/reanime/actions/workflows/ci.yml)
+
 Stream anime from [reanime.to](https://reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it. When it ends, press Enter for the next one, which is already lined up.
 
 Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: current One Piece dub episodes (Egghead onward) that [One Pace](https://github.com/vashhdev/onepace) hasn't covered yet. Works for any show reanime has.
@@ -86,6 +88,7 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | `--m3u [PATH]`  | write an `.m3u` playlist instead. Links expire after 6 hours and only work from your current network |
 | `--mpv PATH`    | path to the mpv binary (default: found automatically)             |
 | `--setup`       | find or install mpv, then exit                                    |
+| `-y`, `--yes`   | install mpv without asking if it's missing (scripts, CI)          |
 
 ### mpv tips
 
@@ -101,6 +104,30 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 4. mpv streams that link with range requests, so seeking works and nothing is saved to disk. Many files are dual audio, so `--dub`/`--sub` just tell mpv which audio track to use.
 
 Links are tied to your IP address and expire after 6 hours, so a range is fetched in batches, each while the previous one plays.
+
+## Development
+
+The tests run offline against fixtures shaped like the real site responses, so they need no network and no mpv:
+
+```bash
+python -m unittest discover -s tests -v
+uvx ruff check .
+```
+
+Every push and pull request runs the [CI pipeline](.github/workflows/ci.yml) in stages. Each stage only runs if the one before it passed:
+
+| Stage | What it checks |
+| --- | --- |
+| 1 · lint | ruff on the Python, shellcheck on `install.sh`, `install.ps1` parses |
+| 2 · test | the offline suite on Windows, macOS and Linux, with Python 3.8 and 3.13 |
+| 3 · build | the package builds and its metadata is valid |
+| 4 · install | the real one-line installers on fresh Windows, macOS and Linux machines: uv, reanime, mpv through the system package manager, then mpv plays a test clip. Termux runs in Docker as an experimental job |
+| 5 · live | reanime.to and flixcloud still work: search, episode list, and the first bytes of a real episode are a Matroska file |
+| 6 · release | on a `v*` tag: checks the tag matches the version, then publishes a GitHub release with the changelog notes |
+
+The pipeline also runs daily, so if reanime changes something, the **live** stage fails.
+
+To release: bump `__version__` in `reanime.py` and `version` in `pyproject.toml`, add a CHANGELOG section, then `git tag v1.1.0 && git push --tags`.
 
 ## Disclaimer
 

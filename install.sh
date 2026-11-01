@@ -3,11 +3,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/vashhdev/reanime/main/install.sh | sh
 # installs uv (which fetches its own Python if you have none), then reanime, then mpv.
 # re-run it any time to update.
+#
+# env overrides (used by CI):
+#   REANIME_PKG=<path, url or requirement>   install this instead of the latest main
+#   REANIME_YES=1                            install mpv without asking
 set -e
 
-PKG="reanime-mpv @ https://github.com/vashhdev/reanime/archive/refs/heads/main.zip"
+PKG="${REANIME_PKG:-reanime-mpv @ https://github.com/vashhdev/reanime/archive/refs/heads/main.zip}"
 
-if [ -n "$TERMUX_VERSION" ]; then
+termux=""
+if [ -n "${TERMUX_VERSION:-}" ]; then termux=1; fi
+case "${PREFIX:-}" in *com.termux*) termux=1 ;; esac
+
+if [ -n "$termux" ]; then
     # uv has no Android build; Termux's own python + pip do the job
     pkg install -y python
     pip install --upgrade --force-reinstall "$PKG"
@@ -19,8 +27,10 @@ else
     uv tool install --force --reinstall "$PKG"
 fi
 
-# piped from curl, this script is stdin; point the mpv install prompt at the terminal
-if ( : </dev/tty ) 2>/dev/null; then
+if [ -n "$REANIME_YES" ]; then
+    reanime --setup --yes
+elif ( : </dev/tty ) 2>/dev/null; then
+    # piped from curl, this script is stdin; point the mpv install prompt at the terminal
     reanime --setup </dev/tty
 else
     reanime --setup

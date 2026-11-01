@@ -191,7 +191,7 @@ def fuzzy_pick(items, label, header, noun="items", initial=0):
 
         if drawn:
             sys.stdout.write(f"{CSI}{drawn}A")   # move cursor up to redraw
-        sys.stdout.write("\r" + f"\n".join(out) + f"{CSI}J\n")
+        sys.stdout.write("\r" + "\n".join(out) + f"{CSI}J\n")
         sys.stdout.flush()
         drawn = len(out)
 
@@ -484,7 +484,7 @@ def ep_title(name, ep):
 
 def ep_label(ep):
     tag = "  [filler]" if ep.get("filler") or ep.get("is_filler") else ""
-    return f"{epnum(ep):>5}  {ep.get('title') or ''}{tag}"
+    return f"{epnum(ep):>5}  {ep.get('title') or ''}{tag}".rstrip()
 
 
 def write_m3u(path, entries, title):
@@ -616,7 +616,7 @@ MPV_INSTALL = {
            ("choco", [["choco", "install", "mpv", "-y"]])],
     "darwin": [("brew", [["brew", "install", "mpv"]]),
                ("port", [["sudo", "port", "install", "mpv"]])],
-    "linux": [("apt", [["sudo", "apt", "install", "-y", "mpv"]]),
+    "linux": [("apt", [["sudo", "apt-get", "update"], ["sudo", "apt-get", "install", "-y", "mpv"]]),
               ("dnf", [["sudo", "dnf", "install", "-y", "mpv"]]),
               ("pacman", [["sudo", "pacman", "-S", "--needed", "--noconfirm", "mpv"]]),
               ("zypper", [["sudo", "zypper", "install", "-y", "mpv"]]),
@@ -675,9 +675,10 @@ def _sudo(cmd):
     return cmd[1:] if cmd[0] == "sudo" and (root or not shutil.which("sudo")) else cmd
 
 
-def ensure_player(mpv):
-    """mpv argv prefix, installing mpv on first run when it is missing. returns None on
-    Android, where the mpv-android app plays instead. exits if there is no player."""
+def ensure_player(mpv, assume_yes=False):
+    """mpv argv prefix, installing mpv on first run when it is missing (without asking
+    when `assume_yes`). returns None on Android, where the mpv-android app plays
+    instead. exits if there is no player."""
     if ANDROID:
         return None
     cmd = find_mpv(mpv)
@@ -692,12 +693,15 @@ def ensure_player(mpv):
     if not candidates:
         sys.exit("no supported package manager found. install mpv from "
                  "https://mpv.io/installation/ and retry.")
-    if not interactive_ok():
-        sys.exit("install it with: " + " && ".join(" ".join(c) for c in candidates[0][1]))
+    if not (assume_yes or interactive_ok()):
+        sys.exit("install it with: " + " && ".join(" ".join(c) for c in candidates[0][1])
+                 + "\nor let reanime do it: reanime --setup --yes")
 
     for mgr, steps in candidates:
         shown = " && ".join(" ".join(c) for c in steps)
-        if input(f"install mpv now via {mgr}?  ({shown}) [Y/n] ").strip().lower() in ("n", "no"):
+        if assume_yes:
+            sys.stderr.write(f"installing mpv via {mgr}: {shown}\n")
+        elif input(f"install mpv now via {mgr}?  ({shown}) [Y/n] ").strip().lower() in ("n", "no"):
             sys.exit("mpv required. aborting.")
         for c in steps:
             subprocess.run(c)           # judged by the result below, not exit codes:
@@ -755,6 +759,8 @@ def main():
     ap.add_argument("--mpv", default="mpv", help="path to mpv binary")
     ap.add_argument("--setup", action="store_true",
                     help="find or install mpv and exit (the installers run this)")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="install mpv without asking if it is missing (scripts, CI)")
     ap.add_argument("--version", action="version", version=f"reanime {__version__}")
     args = ap.parse_args()
 
@@ -766,12 +772,12 @@ def main():
             pass
 
     if args.setup:
-        cmd = ensure_player(args.mpv)
+        cmd = ensure_player(args.mpv, args.yes)
         print(MPV_ANDROID_HELP if cmd is None else f"ready: {' '.join(cmd)}")
         return
     # check the player before any searching, so a first run sets everything up front
     playing = not (args.list or args.print_only or args.m3u is not None)
-    cmd = ensure_player(args.mpv) if playing else None
+    cmd = ensure_player(args.mpv, args.yes) if playing else None
 
     slug, url_ep, url_lang = parse_url(args.anime or "")
     spec = args.episode or url_ep
@@ -789,8 +795,9 @@ def main():
 
     lang = "dub" if args.dub else "sub" if args.sub else url_lang
     if not lang:
-        counts = {l: sum(1 for ep in eps if ep.get(FLAG[l])) for l in ("dub", "sub")}
-        opts = [(f"{LANG_LABEL[l]}  ({counts[l]} episodes)", l) for l in ("dub", "sub") if counts[l]]
+        counts = {lg: sum(1 for ep in eps if ep.get(FLAG[lg])) for lg in ("dub", "sub")}
+        opts = [(f"{LANG_LABEL[lg]}  ({counts[lg]} episodes)", lg)
+                for lg in ("dub", "sub") if counts[lg]]
         if not opts:
             sys.exit(f"{name} has no playable episodes yet")
         if spec or len(opts) == 1 or not interactive_ok():

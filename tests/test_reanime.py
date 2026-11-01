@@ -1,0 +1,579 @@
+"""
+offline tests for reanime.py: no network, no real mpv, stdlib only.
+
+    python -m unittest discover -s tests -v
+
+the site is replaced by fixtures shaped like the real responses (SvelteKit
+__data.json in devalue encoding, the flix server list, flixcloud's prepare-progress
+event stream), so every step of the pipeline runs without touching reanime.to.
+"""
+
+import contextlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+import urllib.error
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import reanime  # noqa: E402
+
+
+# ------------------------------------------------------------------ fixtures
+
+def flatten(value):
+    """encode like SvelteKit's devalue: a flat array where every value is an index."""
+    out = []
+
+    def put(v):
+        i = len(out)
+        out.append(None)
+        if isinstance(v, dict):
+            out[i] = {k: put(x) for k, x in v.items()}
+        elif isinstance(v, list):
+            out[i] = [put(x) for x in v]
+        else:
+            out[i] = v
+        return i
+
+    put(value)
+    return out
+
+
+def svelte(*nodes):
+    """a SvelteKit __data.json body; None entries are skipped nodes."""
+    return json.dumps({"type": "data", "nodes": [
+        None if n is None else {"type": "data", "data": flatten(n)} for n in nodes]})
+
+
+ANIME = {
+    "anime_id": "one-piece-xamk74", "anilist_id": 21, "mal_id": 21, "themoviedb_id": 37854,
+    "external_seasons": {"tmdb": 0, "tvdb": 0},
+    "title": {"english": "ONE PIECE", "romaji": "ONE PIECE", "native": "ONE PIECE"},
+}
+EPISODES = [
+    {"number": 1150, "title": "Egghead A", "subbed": True, "dubbed": True, "playable": True},
+    {"number": 1151, "title": "Her and Her Father's Dream!", "subbed": True, "dubbed": True,
+     "playable": True},
+    {"number": 1152, "title": "Egghead C", "subbed": True, "dubbed": True, "playable": True,
+     "filler": True},
+    {"number": 1180, "title": "", "subbed": True, "dubbed": False, "playable": True},
+]
+SERVERS = json.dumps({"success": True, "servers": [
+    {"serverName": "HD-1", "dataLink": "https://flixcloud.cc/e/hd1file?v=1", "dataType": "sub"},
+    {"serverName": "HD-1", "dataLink": "https://flixcloud.cc/e/hd1file?v=1", "dataType": "dub"},
+    {"serverName": "HD-2", "dataLink": "https://flixcloud.cc/e/gfa1lt2dzeev?v=2", "dataType": "sub"},
+    {"serverName": "HD-2", "dataLink": "https://flixcloud.cc/e/gfa1lt2dzeev?v=2", "dataType": "dub"},
+]})
+TOKEN = "eyJ.a+b/c="                    # needs url-quoting: + / =
+FILE_URL = "https://fetch8.flixcloud.cc/download/7622-uuid?token=eyJ.a%2Bb%2Fc%3D"
+
+URLS = {
+    "https://reanime.to/api/v1/search?limit=20&q=one%20piece": json.dumps({"results": [
+        {"anime_id": "one-piece-film-red-yuq2kp", "title": {"english": "One Piece Film: Red"},
+         "format": "MOVIE"},
+        {"anime_id": "one-piece-xamk74", "title": {"english": "ONE PIECE", "romaji": "ONE PIECE"},
+         "format": "TV", "season_year": 1999, "dubbed": 1157},
+    ]}),
+    "https://reanime.to/watch/one-piece-xamk74/__data.json?ep=1":
+        svelte({"sessionUser": None, "isAuthed": False}, None, {"anime": ANIME, "episodes": EPISODES}),
+    "https://flixcloud.cc/d/gfa1lt2dzeev/__data.json":
+        svelte(None, {"video": {"fileId": "7622-uuid", "filename": "ep.mkv", "sizeHuman": "940 MB"},
+                      "download": {"base": "https://fetch8.flixcloud.cc", "token": TOKEN}}),
+}
+for _n in (1150, 1151, 1152):
+    URLS[f"https://reanime.to/api/flix/21/{_n}?mal=21"] = SERVERS
+
+
+def read(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def fake_fetch(url):
+    if url in URLS:
+        return URLS[url]
+    if "/watch/" in url:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    raise AssertionError(f"unexpected url {url}")
+
+
+class FakeStream:
+    """an event-stream response: comment line, then one data: line per event."""
+
+    def __init__(self, events):
+        self.lines = [b": keepalive\n"] + [f"data: {json.dumps(e)}\n".encode() for e in events]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+@contextlib.contextmanager
+def offline(events=({"status": "ready", "percent": 100},)):
+    """swap the network for the fixtures. yields the event-stream urls opened."""
+    opened = []
+
+    def urlopen(req, timeout=None):
+        opened.append(req.full_url)
+        return FakeStream(events)
+
+    with mock.patch.object(reanime, "fetch", fake_fetch), \
+            mock.patch.object(reanime.urllib.request, "urlopen", urlopen):
+        yield opened
+
+
+def run_main(*argv):
+    """run reanime.main() with argv; returns (exit code, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    code = 0
+    with mock.patch.object(sys, "argv", ["reanime", *argv]), \
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            reanime.main()
+        except SystemExit as e:
+            code = e.code
+    return code, out.getvalue(), err.getvalue()
+
+
+class Terminal:
+    """just enough of a VT100 to replay the picker: \\r \\n, CSI nA / K / J / m, wrapping."""
+
+    def __init__(self, cols):
+        self.cols, self.rows, self.y, self.x = cols, [[]], 0, 0
+
+    def feed(self, raw):
+        i = 0
+        while i < len(raw):
+            m = re.match(r"\x1b\[(\d*)([A-Za-z])", raw[i:])
+            if m:
+                n, cmd = int(m.group(1) or 1), m.group(2)
+                if cmd == "A":
+                    self.y = max(0, self.y - n)
+                elif cmd == "K":
+                    del self.rows[self.y][self.x:]
+                elif cmd == "J":
+                    del self.rows[self.y][self.x:]
+                    del self.rows[self.y + 1:]
+                i += len(m.group(0))
+                continue
+            c = raw[i]
+            if c == "\r":
+                self.x = 0
+            elif c == "\n":
+                self._down()
+            else:
+                if self.x >= self.cols:
+                    self._down()
+                row = self.rows[self.y]
+                row.extend(" " * (self.x - len(row)))
+                if self.x < len(row):
+                    row[self.x] = c
+                else:
+                    row.append(c)
+                self.x += 1
+            i += 1
+        return ["".join(r).rstrip() for r in self.rows]
+
+    def _down(self):
+        self.y, self.x = self.y + 1, 0
+        while len(self.rows) <= self.y:
+            self.rows.append([])
+
+
+# ------------------------------------------------------------------ parsing
+
+class Parsing(unittest.TestCase):
+    def test_devalue_handles_refs_shared_values_and_specials(self):
+        data = [{"a": 1, "b": 1, "when": 3, "gone": -1, "n": 4}, [2, 2], "x", ["Date", "2026-11-01"], 7]
+        out = reanime.devalue(data)
+        self.assertEqual(out["a"], ["x", "x"])
+        self.assertIs(out["a"], out["b"])             # same index -> same object
+        self.assertEqual(out["when"], "2026-11-01")
+        self.assertIsNone(out["gone"])
+        self.assertEqual(out["n"], 7)
+
+    def test_devalue_roundtrips_fixture_encoding(self):
+        self.assertEqual(reanime.devalue(flatten({"anime": ANIME, "episodes": EPISODES})),
+                         {"anime": ANIME, "episodes": EPISODES})
+
+    def test_page_data_picks_the_node_with_the_key(self):
+        with offline():
+            d = reanime.page_data("https://reanime.to/watch/one-piece-xamk74/__data.json?ep=1", "anime")
+        self.assertEqual(d["anime"]["anilist_id"], 21)
+        self.assertEqual(len(d["episodes"]), 4)
+
+    def test_parse_url(self):
+        self.assertEqual(reanime.parse_url(
+            "https://reanime.to/watch/one-piece-xamk74?ep=1151&lang=dub&server=HD-2"),
+            ("one-piece-xamk74", "1151", "dub"))
+        self.assertEqual(reanime.parse_url("https://reanime.to/anime/one-piece-xamk74"),
+                         ("one-piece-xamk74", None, None))
+        self.assertEqual(reanime.parse_url("https://reanime.to/watch/x-abc123?lang=fr"),
+                         ("x-abc123", None, None))
+        self.assertEqual(reanime.parse_url("one piece"), (None, None, None))
+
+    def test_titles_and_numbers(self):
+        self.assertEqual(reanime.title_of({"romaji": "Shingeki", "english": "Attack on Titan"}),
+                         "Attack on Titan")
+        self.assertEqual(reanime.title_of({}), "?")
+        self.assertEqual(reanime.titles("plain"), ["plain"])
+        self.assertEqual(reanime.epnum({"number": 1151}), "1151")
+        self.assertEqual(reanime.epnum({"number": 6.5}), "6.5")
+        self.assertEqual(reanime.epnum({"episode_number": 3.0}), "3")
+        self.assertIn("[filler]", reanime.ep_label(EPISODES[2]))
+        self.assertTrue(reanime.ep_label(EPISODES[1]).startswith(" 1151  Her"))
+
+    def test_select_eps(self):
+        eps = EPISODES[:3]
+        self.assertEqual(reanime.select_eps(eps, "1151", "dub"), ([1], False))
+        self.assertEqual(reanime.select_eps(eps, "1150-1151", "dub"), ([0, 1], True))
+        self.assertEqual(reanime.select_eps(eps, "1151-", "dub"), ([1, 2], True))
+        with self.assertRaises(SystemExit) as cm:
+            reanime.select_eps(eps, "9999", "dub")
+        self.assertIn("1150-1152", str(cm.exception))
+        with self.assertRaises(SystemExit):
+            reanime.select_eps(eps, "abc", "dub")
+
+
+# ------------------------------------------------------------------ network steps
+
+class Pipeline(unittest.TestCase):
+    def test_file_id_prefers_hd2_and_filters_language(self):
+        servers = json.loads(SERVERS)["servers"]
+        self.assertEqual(reanime.file_id(servers, "dub"), "gfa1lt2dzeev")
+        self.assertEqual(reanime.file_id(servers[:2], "sub"), "hd1file")
+        other = [{"serverName": "HD-3", "dataLink": "https://elsewhere/e/zzz", "dataType": "dub"}]
+        self.assertIsNone(reanime.file_id(other, "dub"))
+
+    def test_servers_url_uses_anilist_then_tmdb(self):
+        calls = []
+        ok = json.dumps({"success": True, "servers": [1]})
+        with mock.patch.object(reanime, "fetch", lambda u: calls.append(u) or ok):
+            self.assertEqual(reanime.servers(ANIME, {"number": 1151}), [1])
+            reanime.servers({"themoviedb_id": 99, "external_seasons": {"tmdb": 2}}, {"number": 4})
+            self.assertEqual(reanime.servers({}, {"number": 1}), [])
+        self.assertEqual(calls, ["https://reanime.to/api/flix/21/1151?mal=21",
+                                 "https://reanime.to/api/flix/0/4?tmdb=99&season=2"])
+
+    def test_resolve_builds_quoted_download_url(self):
+        with offline() as opened:
+            url, video = reanime.resolve(ANIME, EPISODES[1], "dub")
+        self.assertEqual(url, FILE_URL)
+        self.assertEqual(video["sizeHuman"], "940 MB")
+        self.assertEqual(opened, [FILE_URL.replace("?token", "/progress?token")])
+
+    def test_resolve_waits_through_building(self):
+        events = [{"status": "queued", "percent": 0}, {"status": "building", "percent": 40},
+                  {"status": "ready", "percent": 100}]
+        err = io.StringIO()
+        with offline(events), contextlib.redirect_stderr(err):
+            url, _ = reanime.resolve(ANIME, EPISODES[1], "dub")
+        self.assertEqual(url, FILE_URL)
+        self.assertIn("building 40%", err.getvalue())
+
+    def test_resolve_reports_failed_and_unfinished_prep(self):
+        with offline([{"status": "failed", "error": "disk full"}]):
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                reanime.resolve(ANIME, EPISODES[1], "dub", verbose=False)
+        with offline([{"status": "building", "percent": 10}]):
+            with self.assertRaisesRegex(RuntimeError, "ended before"):
+                reanime.resolve(ANIME, EPISODES[1], "dub", verbose=False)
+
+    def test_resolve_without_language_source(self):
+        sub_only = json.dumps({"success": True, "servers": json.loads(SERVERS)["servers"][:1]})
+        with offline(), mock.patch.dict(URLS, {"https://reanime.to/api/flix/21/1151?mal=21": sub_only}):
+            with self.assertRaisesRegex(LookupError, "no dub source"):
+                reanime.resolve(ANIME, EPISODES[1], "dub")
+
+    def test_find_anime_prefers_exact_title_and_falls_back_from_bad_slug(self):
+        err = io.StringIO()
+        with offline(), contextlib.redirect_stderr(err):
+            anime, eps = reanime.find_anime("one piece", auto=True)
+            self.assertEqual(anime["anime_id"], "one-piece-xamk74")
+            anime, _ = reanime.find_anime("one-piece-xamk74", auto=True)       # slug, no search
+            self.assertEqual(anime["anime_id"], "one-piece-xamk74")
+        self.assertIn("using ONE PIECE", err.getvalue())
+
+
+# ------------------------------------------------------------------ main()
+
+class Main(unittest.TestCase):
+    def test_print_single_episode(self):
+        with offline():
+            code, out, err = run_main("one piece", "1151", "--dub", "--print")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), FILE_URL)
+
+    def test_print_range_from_pasted_url(self):
+        with offline():
+            code, out, err = run_main("https://reanime.to/watch/one-piece-xamk74?ep=1150-1152&lang=dub",
+                                      "--print")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.split(), [FILE_URL] * 3)
+
+    def test_list(self):
+        with offline():
+            code, out, _ = run_main("one-piece-xamk74", "--list")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], "S-   1180")
+        self.assertIn("SD   1152  Egghead C  [filler]", out)
+
+    def test_m3u(self):
+        with offline(), tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.m3u")
+            code, out, err = run_main("one piece", "1150-1151", "--dub", "--m3u", path)
+            self.assertEqual(code, 0, err)
+            text = read(path)
+        self.assertTrue(text.startswith("#EXTM3U\n#PLAYLIST:ONE PIECE 1150-1151 (dub)"))
+        self.assertIn("#EXTINF:-1,ONE PIECE - 1151 - Her and Her Father's Dream!\n" + FILE_URL, text)
+
+    def test_dub_episode_that_only_has_sub(self):
+        with offline():
+            code, _, _ = run_main("one piece", "1180", "--dub", "--print")
+        self.assertIn("no dub release", str(code))
+
+    def test_setup_reports_player(self):
+        with mock.patch.object(reanime, "find_mpv", return_value=["/usr/bin/mpv"]):
+            code, out, _ = run_main("--setup")
+        self.assertEqual((code, out.strip()), (0, "ready: /usr/bin/mpv"))
+
+    def test_version_matches_pyproject_and_changelog(self):
+        pyproject = read(os.path.join(ROOT, "pyproject.toml"))
+        changelog = read(os.path.join(ROOT, "CHANGELOG.md"))
+        self.assertEqual(re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1),
+                         reanime.__version__)
+        self.assertIn(f"## [{reanime.__version__}]", changelog)
+
+
+# ------------------------------------------------------------------ terminal UI
+
+class Picker(unittest.TestCase):
+    def pick(self, keys, cols=120, lines=40, header="\nONE PIECE (sub):"):
+        eps = [{"number": n, "title": f"Episode {n} " + "long title " * (8 if n % 7 == 0 else 0)}
+               for n in range(1, 1181)]
+        keys = iter(keys)
+        out = io.StringIO()
+        with mock.patch.object(reanime, "interactive_ok", return_value=True), \
+                mock.patch.object(reanime, "_getkey", lambda: next(keys)), \
+                mock.patch.object(reanime.shutil, "get_terminal_size",
+                                  return_value=os.terminal_size((cols, lines))), \
+                contextlib.redirect_stdout(out):
+            picked = reanime.fuzzy_pick(eps, reanime.ep_label, header, noun="episodes",
+                                        initial=len(eps) - 1)
+        return picked, Terminal(cols).feed(out.getvalue())
+
+    def test_redraw_never_duplicates_header_or_hint(self):
+        moves = [("key", "up")] * 30 + [("key", "down")] * 5 + [("key", "enter")]
+        for cols, lines in ((120, 40), (60, 14), (30, 8)):
+            picked, screen = self.pick(moves, cols, lines)
+            self.assertEqual(picked["number"], 1155)
+            self.assertEqual(sum("ONE PIECE (sub):" in s for s in screen), 1, (cols, screen))
+            self.assertEqual(sum(s.startswith("type to filter") for s in screen), 1, (cols, screen))
+            self.assertLessEqual(len(screen), lines + 2)   # header block + one redraw region
+
+    def test_typing_filters_by_episode_prefix(self):
+        keys = [("char", c) for c in "1151"] + [("key", "enter")]
+        picked, screen = self.pick(keys)
+        self.assertEqual(picked["number"], 1151)
+        self.assertIn("1/1180 episodes", screen[-2])
+
+    def test_escape_cancels(self):
+        self.assertIsNone(self.pick([("key", "esc")])[0])
+
+
+# ------------------------------------------------------------------ playback
+
+def fake_resolve(anime, ep, lang, verbose=True):
+    return f"https://u/{reanime.epnum(ep)}", {"sizeHuman": "1 MB"}
+
+
+class Playback(unittest.TestCase):
+    eps = [{"number": n, "title": f"T{n}"} for n in (1, 2, 3)]
+
+    def test_mpv_args(self):
+        self.assertEqual(reanime.mpv_args("dub"), ["--alang=eng,en", "--sid=no"])
+        self.assertEqual(reanime.mpv_args("sub"), ["--alang=jpn,ja", "--slang=eng,en"])
+
+    def run_loop(self, start, script):
+        launched, menus = [], []
+
+        def menu(opts, default, header):
+            menus.append((opts, default, header))
+            return [v for _, v in opts].index(script.pop(0))
+
+        with mock.patch.object(reanime, "resolve", fake_resolve), \
+                mock.patch.object(reanime, "launch", lambda c, u, t, lg: launched.append((u, t))), \
+                mock.patch.object(reanime, "menu_pick", menu), \
+                contextlib.redirect_stderr(io.StringIO()):
+            reanime.play_loop(["mpv"], ANIME, self.eps, start, "dub")
+        return launched, menus
+
+    def test_loop_next_replay_previous(self):
+        launched, menus = self.run_loop(0, ["next", "replay", "prev", "quit"])
+        self.assertEqual([u for u, _ in launched], ["https://u/1", "https://u/2", "https://u/2",
+                                                     "https://u/1"])
+        self.assertEqual(launched[1][1], "ONE PIECE - 2 - T2")
+        opts, default, _ = menus[0]
+        self.assertEqual(opts[default][1], "next")
+
+    def test_loop_defaults_to_quit_on_newest_episode(self):
+        _, menus = self.run_loop(2, ["quit"])
+        opts, default, _ = menus[0]
+        self.assertEqual(opts[default][1], "quit")
+        self.assertNotIn("next", [v for _, v in opts])
+
+    def test_range_plays_in_chunks_with_per_episode_titles(self):
+        eps = [{"number": n, "title": f"T{n}"} for n in range(1151, 1170)]
+        runs = []
+        resolve_many = lambda a, chunk, lang, quiet=False: [   # noqa: E731
+            (e, f"https://u/{e['number']}", {}) for e in chunk]
+        with mock.patch.object(reanime, "resolve_many", resolve_many), \
+                mock.patch.object(reanime.subprocess, "run", lambda c, **k: runs.append(c)), \
+                mock.patch.object(reanime, "menu_pick", return_value=0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            reanime.play_range(["mpv"], ANIME, eps, "dub")
+        self.assertEqual([sum(a.startswith("https://") for a in r) for r in runs], [8, 8, 3])
+        self.assertEqual(runs[0][:6], ["mpv", "--alang=eng,en", "--sid=no", "--{",
+                                       "--force-media-title=ONE PIECE - 1151 - T1151",
+                                       "https://u/1151"])
+
+    def test_range_stops_when_user_quits(self):
+        eps = [{"number": n} for n in range(1, 20)]
+        runs = []
+        with mock.patch.object(reanime, "resolve_many",
+                               lambda a, chunk, lang, quiet=False: [(e, "https://u", {}) for e in chunk]), \
+                mock.patch.object(reanime.subprocess, "run", lambda c, **k: runs.append(c)), \
+                mock.patch.object(reanime, "menu_pick", return_value=1), \
+                contextlib.redirect_stderr(io.StringIO()):
+            reanime.play_range(["mpv"], ANIME, eps, "dub")
+        self.assertEqual(len(runs), 1)
+
+
+# ------------------------------------------------------------------ player setup
+
+class Setup(unittest.TestCase):
+    def patches(self, found, managers=("apt", "flatpak"), tty=False, answer=""):
+        """mpv missing until a run of a manager listed in `found` completes."""
+        state = {"installed": False, "ran": []}
+
+        def run(cmd, **kw):
+            state["ran"].append(cmd)
+            if any(m in cmd for m in found):
+                state["installed"] = True
+            return subprocess.CompletedProcess(cmd, 0)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(reanime, "ANDROID", False))
+        stack.enter_context(mock.patch.object(reanime, "_os_key", return_value="linux"))
+        stack.enter_context(mock.patch.object(
+            reanime, "find_mpv", lambda mpv: ["/usr/bin/mpv"] if state["installed"] else None))
+        stack.enter_context(mock.patch.object(
+            reanime.shutil, "which", lambda c: f"/usr/bin/{c}" if c in managers + ("sudo",) else None))
+        stack.enter_context(mock.patch.object(reanime.os, "geteuid", create=True, return_value=1000))
+        stack.enter_context(mock.patch.object(reanime.subprocess, "run", run))
+        stack.enter_context(mock.patch.object(reanime, "interactive_ok", return_value=tty))
+        stack.enter_context(mock.patch("builtins.input", return_value=answer))
+        stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        return stack, state
+
+    def test_noninteractive_without_yes_explains(self):
+        stack, state = self.patches(found=())
+        with stack, self.assertRaises(SystemExit) as cm:
+            reanime.ensure_player("mpv")
+        self.assertIn("sudo apt-get update && sudo apt-get install -y mpv", str(cm.exception))
+        self.assertIn("--setup --yes", str(cm.exception))
+        self.assertEqual(state["ran"], [])
+
+    def test_yes_installs_and_falls_back_to_next_manager(self):
+        stack, state = self.patches(found=("io.mpv.Mpv",))      # apt "fails", flatpak works
+        with stack:
+            self.assertEqual(reanime.ensure_player("mpv", assume_yes=True), ["/usr/bin/mpv"])
+        self.assertEqual(state["ran"][:2], [["sudo", "apt-get", "update"],
+                                            ["sudo", "apt-get", "install", "-y", "mpv"]])
+        self.assertEqual(state["ran"][-1][:3], ["flatpak", "install", "--user"])
+
+    def test_prompt_yes_and_no(self):
+        stack, _ = self.patches(found=("mpv",), tty=True, answer="")
+        with stack:
+            self.assertEqual(reanime.ensure_player("mpv"), ["/usr/bin/mpv"])
+        stack, state = self.patches(found=("mpv",), tty=True, answer="n")
+        with stack, self.assertRaises(SystemExit):
+            reanime.ensure_player("mpv")
+        self.assertEqual(state["ran"], [])
+
+    def test_explicit_missing_path_and_no_manager(self):
+        stack, _ = self.patches(found=())
+        with stack, self.assertRaisesRegex(SystemExit, "mpv not found at /opt/x/mpv"):
+            reanime.ensure_player("/opt/x/mpv")
+        stack, _ = self.patches(found=(), managers=())
+        with stack, self.assertRaisesRegex(SystemExit, "no supported package manager"):
+            reanime.ensure_player("mpv", assume_yes=True)
+
+    def test_sudo_is_dropped_for_root_or_when_missing(self):
+        cmd = ["sudo", "apt-get", "install", "-y", "mpv"]
+        with mock.patch.object(reanime.os, "geteuid", create=True, return_value=0), \
+                mock.patch.object(reanime.shutil, "which", return_value="/usr/bin/sudo"):
+            self.assertEqual(reanime._sudo(cmd), cmd[1:])
+        with mock.patch.object(reanime.os, "geteuid", create=True, return_value=1000), \
+                mock.patch.object(reanime.shutil, "which", return_value="/usr/bin/sudo"):
+            self.assertEqual(reanime._sudo(cmd), cmd)
+        with mock.patch.object(reanime.os, "geteuid", create=True, return_value=1000), \
+                mock.patch.object(reanime.shutil, "which", return_value=None):
+            self.assertEqual(reanime._sudo(cmd), cmd[1:])
+
+    def test_find_mpv_in_install_dir_and_flatpak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "mpv.exe" if os.name == "nt" else "mpv")
+            open(exe, "w").close()
+            with mock.patch.object(reanime.shutil, "which", return_value=None), \
+                    mock.patch.dict(reanime.MPV_DIRS, {reanime._os_key(): [tmp]}):
+                self.assertEqual(reanime.find_mpv("mpv"), [exe])
+        with mock.patch.object(reanime.shutil, "which",
+                               lambda c: "/usr/bin/flatpak" if c == "flatpak" else None), \
+                mock.patch.dict(reanime.MPV_DIRS, {reanime._os_key(): []}), \
+                mock.patch.object(reanime.glob, "glob", return_value=[]), \
+                mock.patch.object(reanime.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(reanime.find_mpv("mpv"), ["flatpak", "run", "io.mpv.Mpv"])
+        with mock.patch.object(reanime.shutil, "which", return_value=None):
+            self.assertIsNone(reanime.find_mpv("/definitely/not/here/mpv"))
+
+
+class Android(unittest.TestCase):
+    def test_no_mpv_needed_and_setup_points_to_app(self):
+        with mock.patch.object(reanime, "ANDROID", True):
+            self.assertIsNone(reanime.ensure_player("mpv"))
+            code, out, _ = run_main("--setup")
+        self.assertEqual(code, 0)
+        self.assertIn("is.xyz.mpv", out)
+
+    def test_intent_and_errors(self):
+        seen = []
+        ok = subprocess.CompletedProcess([], 0, "Starting: Intent", "")
+        with mock.patch.object(reanime.subprocess, "run", lambda c, **k: seen.append(c) or ok):
+            reanime.android_open("https://x/ep.mkv")
+        self.assertEqual(seen[0], ["am", "start", "--user", "0", "-a", "android.intent.action.VIEW",
+                                   "-d", "https://x/ep.mkv", "-n", "is.xyz.mpv/.MPVActivity"])
+        bad = subprocess.CompletedProcess([], 0, "", "Error: Activity class does not exist")
+        with mock.patch.object(reanime.subprocess, "run", return_value=bad), \
+                self.assertRaisesRegex(SystemExit, "mpv-android"):
+            reanime.android_open("https://x")
+        with mock.patch.object(reanime.subprocess, "run", side_effect=FileNotFoundError), \
+                self.assertRaisesRegex(SystemExit, "termux-am"):
+            reanime.android_open("https://x")
+
+
+if __name__ == "__main__":
+    unittest.main()

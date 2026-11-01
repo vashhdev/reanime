@@ -28,3 +28,13 @@ reanime = "reanime:main"
 
 [tool.setuptools]
 py-modules = ["reanime"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 110
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle errors, bugbear. E401: `import termios, tty, select` is the
+# onepace house style for the optional POSIX imports
+select = ["E", "F", "B", "W"]
+ignore = ["E401"]
