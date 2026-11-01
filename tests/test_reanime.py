@@ -1,11 +1,13 @@
 """
-offline tests for reanime.py: no network, no real mpv, stdlib only.
+offline tests for reanime.py: no network, stdlib only.
 
     python -m unittest discover -s tests -v
 
 the site is replaced by fixtures shaped like the real responses (SvelteKit
 __data.json in devalue encoding, the flix server list, flixcloud's prepare-progress
 event stream), so every step of the pipeline runs without touching reanime.to.
+one test plays tests/fixtures/partial-subs.mkv in a real mpv when one is installed,
+and is skipped otherwise.
 """
 
 import contextlib
@@ -23,6 +25,18 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import reanime  # noqa: E402
+
+# every test writes reanime's cache (the sub-mode mpv script) here, never the real one
+CACHE = None
+
+
+def setUpModule():
+    global CACHE
+    CACHE = tempfile.TemporaryDirectory()
+    patcher = mock.patch.object(reanime, "cache_dir", lambda: os.path.join(CACHE.name, "reanime"))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(CACHE.cleanup)
 
 
 # ------------------------------------------------------------------ fixtures
@@ -404,7 +418,11 @@ class Playback(unittest.TestCase):
 
     def test_mpv_args(self):
         self.assertEqual(reanime.mpv_args("dub"), ["--alang=eng,en", "--sid=no"])
-        self.assertEqual(reanime.mpv_args("sub"), ["--alang=jpn,ja", "--slang=eng,en"])
+        picker = os.path.join(CACHE.name, "reanime", "pick-subs.lua")
+        self.assertEqual(reanime.mpv_args("sub"),
+                         ["--alang=jpn,ja", "--slang=eng,en", f"--script={picker}"])
+        with open(picker, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), reanime.SUB_PICKER)
 
     def run_loop(self, start, script):
         launched, menus = [], []
@@ -462,6 +480,63 @@ class Playback(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ player setup
+
+class SubPicker(unittest.TestCase):
+    """sub mode's mpv script that skips title-card / signs tracks flagged as default."""
+
+    def test_written_once_and_repaired_when_changed(self):
+        path = reanime.sub_picker()
+        with mock.patch.object(reanime.os, "makedirs", side_effect=AssertionError("rewrote")):
+            self.assertEqual(reanime.sub_picker(), path)        # up to date: left alone
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("-- stale")
+        reanime.sub_picker()
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), reanime.SUB_PICKER)
+
+    def test_unwritable_cache_falls_back_to_plain_slang(self):
+        blocker = os.path.join(CACHE.name, "not-a-dir")
+        with open(blocker, "w") as fh:
+            fh.write("x")
+        with mock.patch.object(reanime, "cache_dir", lambda: os.path.join(blocker, "reanime")):
+            self.assertIsNone(reanime.sub_picker())
+            self.assertEqual(reanime.mpv_args("sub"), ["--alang=jpn,ja", "--slang=eng,en"])
+
+    def test_partial_words_match_real_partial_titles_only(self):
+        words = re.findall(r'"([^"]+)"', re.search(r"local partial = \{(.*)\}", reanime.SUB_PICKER)[1])
+
+        def partial(title):
+            return any(w in title.lower() for w in words)
+        # track titles seen on reanime's files
+        for title in ("Episode Name (Restyled By Simmsy)", "Episode Name (Orignal)", "Forced",
+                      "Signs & Songs", "Dubtitle(AI)"):
+            self.assertTrue(partial(title), title)
+        for title in ("Full Subtitles (Restyled By Simmsy)", "Full Subtitles (Orignal)",
+                      "Track 4 (ENG)", "English", "Dialogue"):
+            self.assertFalse(partial(title), title)
+
+    def test_real_mpv_skips_the_title_card_track(self):
+        # tests/fixtures/partial-subs.mkv: English "Episode Name" [default], "Signs & Songs",
+        # "Full Subtitles". REANIME_TEST_MPV makes this mandatory (CI's install stage)
+        forced = os.environ.get("REANIME_TEST_MPV")
+        cmd = [forced] if forced else reanime.find_mpv("mpv")
+        if not cmd:
+            self.skipTest("mpv not installed")
+        fixture = os.path.join(ROOT, "tests", "fixtures", "partial-subs.mkv")
+
+        def picked(args):
+            log = os.path.join(CACHE.name, "mpv.log")
+            subprocess.run([*cmd, "--no-config", "--vo=null", "--ao=null", "--frames=1", *args,
+                            "--term-playing-msg=subs=${current-tracks/sub/title:none}",
+                            f"--log-file={log}", fixture],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                return re.findall(r"\] subs=(.*)", fh.read())
+
+        # control: plain --slang lands on the title card, the bug the picker fixes
+        self.assertEqual(picked(["--slang=eng,en"]), ["Episode Name"])
+        self.assertEqual(picked(reanime.mpv_args("sub")), ["Full Subtitles"])
+
 
 class Setup(unittest.TestCase):
     def patches(self, found, managers=("apt", "flatpak"), tty=False, answer=""):

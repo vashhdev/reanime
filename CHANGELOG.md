@@ -26,6 +26,11 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
+- **Sub mode shows the full English subtitles.** Some files (One Piece episode 1, for
+  one) mark the episode-title card as the default English track, so mpv showed only
+  the title. A small mpv script now picks the English track by name, skipping
+  episode-name, signs, songs, forced and AI "dubtitle" tracks. It runs in desktop
+  mpv; mpv-android still picks on its own.
 - Episodes without a title no longer leave trailing spaces in the picker and `--list`.
 
 ## [1.0.0] - 2026-11-01
