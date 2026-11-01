@@ -470,11 +470,80 @@ def resolve_many(anime, eps, lang, quiet=False):
 
 # ------------------------------------------------------------------ playback
 
+# some releases flag the episode title card or a signs-only track as the default
+# English subtitles, so --slang alone shows next to nothing. this mpv script picks
+# the English track by its title instead, before mpv selects tracks. if it can't
+# load (no Lua, unreadable file), mpv simply picks the way it always did.
+SUB_PICKER = """\
+-- written by reanime (sub mode): pick full English subtitles over partial tracks
+local partial = {"episode name", "episode title", "sign", "song", "forced", "karaoke", "dubtitle"}
+
+local function is_partial(t)
+    if t.forced then return true end
+    local title = (t.title or ""):lower()
+    for _, word in ipairs(partial) do
+        if title:find(word, 1, true) then return true end
+    end
+    return false
+end
+
+local function is_english(t)
+    local lang = (t.lang or ""):lower()
+    return lang == "eng" or lang == "en" or lang:sub(1, 3) == "en-"
+end
+
+-- runs after a file opens and before mpv selects its tracks. file-local, so each
+-- episode in a playlist gets its own pick
+mp.add_hook("on_preloaded", 50, function()
+    if mp.get_property("options/sid") ~= "auto" then return end
+    local best
+    for _, t in ipairs(mp.get_property_native("track-list") or {}) do
+        if t.type == "sub" and is_english(t) and not is_partial(t)
+                and (not best or (t.default and not best.default)) then
+            best = t
+        end
+    end
+    if best then mp.set_property("file-local-options/sid", tostring(best.id)) end
+end)
+"""
+
+
+def cache_dir():
+    """per-user cache folder. not the temp folder: other users can write there, and a
+    flatpak mpv only sees its own private /tmp."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "reanime")
+
+
+def sub_picker():
+    """write SUB_PICKER where mpv can load it. its path, or None if it can't be written."""
+    path = os.path.join(cache_dir(), "pick-subs.lua")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == SUB_PICKER:
+                return path
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(SUB_PICKER)
+    except OSError:
+        return None
+    return path
+
+
 def mpv_args(lang):
     if lang == "dub":
         # dual-audio files flag the full English subs as default; keep them off over a dub
         return ["--alang=eng,en", "--sid=no"]
-    return ["--alang=jpn,ja", "--slang=eng,en"]
+    picker = sub_picker()
+    return ["--alang=jpn,ja", "--slang=eng,en"] + ([f"--script={picker}"] if picker else [])
 
 
 def ep_title(name, ep):

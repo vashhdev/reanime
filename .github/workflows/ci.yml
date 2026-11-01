@@ -117,6 +117,8 @@ jobs:
           mpv="${ready#ready: }"
           # unquoted on purpose: "flatpak run io.mpv.Mpv" has to split into words
           $mpv --vo=null --ao=null --frames=10 av://lavfi:testsrc=duration=1
+          # sub mode's Lua subtitle picker works in this mpv build
+          REANIME_TEST_MPV="$mpv" python3 -m unittest -v tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track
       - name: reanime runs, mpv found and plays
         if: runner.os == 'Windows'
         shell: pwsh
@@ -127,6 +129,10 @@ jobs:
           $ready
           $mpv = $ready -replace '^ready: ', ''
           & $mpv --vo=null --ao=null --frames=10 av://lavfi:testsrc=duration=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # sub mode's Lua subtitle picker works in this mpv build
+          $env:REANIME_TEST_MPV = $mpv
+          python -m unittest -v tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   ok:
@@ -183,20 +189,31 @@ jobs:
         run: python3 reanime.py "one piece" --list | tail -n 3
       - name: mpv
         run: python3 reanime.py --setup --yes
+      # both steps give mpv exactly the options reanime gives it (mpv_args)
       - name: dub episode plays in mpv, English audio picked
         run: |
           set -o pipefail
           url="$(python3 reanime.py "one piece" 1151 --dub --print)"
           echo "::add-mask::$url"
-          mpv --vo=null --ao=null --frames=1 --ytdl=no --alang=eng,en --sid=no \
+          read -r -a opts <<< "$(python3 -c 'import reanime; print(*reanime.mpv_args("dub"))')"
+          mpv --vo=null --ao=null --frames=1 --ytdl=no "${opts[@]}" \
             --term-playing-msg='audio=${current-tracks/audio/lang}' "$url" 2>&1 | tee mpv.log
           grep -qx 'audio=eng' mpv.log
-      - name: sub episode plays in mpv
+      - name: sub episode plays in mpv, full English subtitles picked
         run: |
+          set -o pipefail
           url="$(python3 reanime.py "one piece" 1 --sub --print)"
           echo "::add-mask::$url"
-          mpv --vo=null --ao=null --frames=1 --ytdl=no --alang=jpn,ja --slang=eng,en \
-            --term-playing-msg='audio=${current-tracks/audio/lang} subs=${current-tracks/sub/lang}' "$url"
+          read -r -a opts <<< "$(python3 -c 'import reanime; print(*reanime.mpv_args("sub"))')"
+          mpv --vo=null --ao=null --frames=1 --ytdl=no "${opts[@]}" \
+            --term-playing-msg='audio=${current-tracks/audio/lang} subs=${current-tracks/sub/title:none}' \
+            "$url" 2>&1 | tee mpv.log
+          grep -q '^audio=jpn subs=' mpv.log
+          # episode 1's file flags its "Episode Name" title-card track as the default
+          if grep -qiE '^audio=.* subs=(none|.*(episode name|sign|song|forced))' mpv.log; then
+            echo "::error::sub mode picked a partial subtitle track or none"
+            exit 1
+          fi
 
   release:
     name: 6 · release

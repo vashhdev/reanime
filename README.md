@@ -93,15 +93,16 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 ### mpv tips
 
 - `#` cycles audio tracks (dub / Japanese on dual-audio files), `j` cycles subtitles. Dub mode starts with subtitles off. Many files have an English `Forced` track that only translates on-screen signs, which is handy with the dub.
+- Sub mode picks the full English subtitles by track name. Some files mark the episode-title card or a signs-only track as the default English subtitles, which mpv alone would show. reanime handles this with a small mpv script it keeps in your cache folder (`%LOCALAPPDATA%\reanime` on Windows, `~/Library/Caches/reanime` on macOS, `~/.cache/reanime` on Linux).
 - In a range, `<` / `>` go to the previous / next episode. Ranges play in batches of 8 episodes, and reanime asks before starting the next batch.
-- **mpv-android:** the app picks the audio track itself. For dub-by-default, add `alang=eng` under Settings > Advanced > Edit mpv.conf.
+- **mpv-android:** the app picks the audio and subtitle tracks itself. For dub-by-default, add `alang=eng` under Settings > Advanced > Edit mpv.conf. If a sub episode only shows the episode title, switch to the "Full Subtitles" track from the subtitle button.
 
 ## How it works
 
 1. Searches reanime (`/api/v1/search`) and reads the show's episode list, with sub/dub flags, from its watch page data.
 2. Asks reanime's server list (`/api/flix/<anilist id>/<episode>`) which [flixcloud](https://flixcloud.cc) file serves that episode in your language.
 3. Gets a direct `.mkv` link from flixcloud's download page, waiting until flixcloud marks the file ready (usually instant).
-4. mpv streams that link with range requests, so seeking works and nothing is saved to disk. Many files are dual audio, so `--dub`/`--sub` just tell mpv which audio track to use.
+4. mpv streams that link with range requests, so seeking works and nothing is saved to disk. Many files are dual audio, so `--dub`/`--sub` just tell mpv which audio track to use, and in sub mode which English subtitle track is the full one.
 
 Links are tied to your IP address and expire after 6 hours, so a range is fetched in batches, each while the previous one plays.
 
