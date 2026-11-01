@@ -152,7 +152,8 @@ jobs:
 
   live:
     # hits the real site: search, episode list, the flix server list, flixcloud's
-    # download route, and the first bytes of an actual episode file. a failure here
+    # download route, then mpv (the client that streams the file for real users)
+    # opens actual episodes with the same options reanime gives it. a failure here
     # with green tests means reanime or flixcloud changed something.
     name: 5 · live site check
     needs: test
@@ -161,18 +162,22 @@ jobs:
       - uses: actions/checkout@v7
       - name: search + episode list
         run: python3 reanime.py "one piece" --list | tail -n 3
-      - name: dub episode resolves to a real mkv
+      - name: mpv
+        run: python3 reanime.py --setup --yes
+      - name: dub episode plays in mpv, English audio picked
         run: |
+          set -o pipefail
           url="$(python3 reanime.py "one piece" 1151 --dub --print)"
           echo "::add-mask::$url"
-          magic="$(curl -fsS -r 0-3 "$url" | od -An -tx1 | tr -d ' \n')"
-          echo "first bytes: $magic"
-          test "$magic" = "1a45dfa3"
-      - name: sub episode resolves
+          mpv --vo=null --ao=null --frames=1 --ytdl=no --alang=eng,en --sid=no \
+            --term-playing-msg='audio=${current-tracks/audio/lang}' "$url" 2>&1 | tee mpv.log
+          grep -qx 'audio=eng' mpv.log
+      - name: sub episode plays in mpv
         run: |
           url="$(python3 reanime.py "one piece" 1 --sub --print)"
           echo "::add-mask::$url"
-          curl -fsS -r 0-3 -o /dev/null "$url"
+          mpv --vo=null --ao=null --frames=1 --ytdl=no --alang=jpn,ja --slang=eng,en \
+            --term-playing-msg='audio=${current-tracks/audio/lang} subs=${current-tracks/sub/lang}' "$url"
 
   release:
     name: 6 · release

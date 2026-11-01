@@ -122,7 +122,7 @@ Every push and pull request runs the [CI pipeline](.github/workflows/ci.yml) in 
 | 2 · test | the offline suite on Windows, macOS and Linux, with Python 3.8 and 3.13 |
 | 3 · build | the package builds and its metadata is valid |
 | 4 · install | the real one-line installers on fresh Windows, macOS and Linux machines: uv, reanime, mpv through the system package manager, then mpv plays a test clip. Termux runs in Docker as an experimental job |
-| 5 · live | reanime.to and flixcloud still work: search, episode list, and the first bytes of a real episode are a Matroska file |
+| 5 · live | reanime.to and flixcloud still work: search, episode list, and mpv opens real episodes, picking the English track on a dub |
 | 6 · release | on a `v*` tag: checks the tag matches the version, then publishes a GitHub release with the changelog notes |
 
 The pipeline also runs daily, so if reanime changes something, the **live** stage fails.
