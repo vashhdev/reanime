@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# saved html scraped copies (dev-only artifacts, not needed at runtime)
+*.html
+*_files/
+
+# generated playlists (links expire, tied to your IP)
+*.m3u
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
