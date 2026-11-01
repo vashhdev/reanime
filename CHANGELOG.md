@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **CI pipeline** (GitHub Actions): lint, offline tests on Windows/macOS/Linux with
+  Python 3.8 and 3.13, package build, the real installers on fresh machines (plus
+  Termux in Docker), a daily live check against reanime.to, and tag-driven releases.
+- **Offline test suite** (`tests/`, stdlib `unittest`) covering every pipeline step
+  against fixtures, `main()` end to end, the picker redraw, playback, mpv setup and
+  Android.
+- **`-y` / `--yes`** installs mpv without asking. The installers accept
+  `REANIME_YES=1` and `REANIME_PKG=<path or url>` (used by CI).
+
+### Changed
+
+- apt installs refresh the package lists first (`apt-get update`), so mpv installs
+  on fresh machines and containers.
+- `install.ps1` judges each step by its exit code, so uv's progress output can't
+  abort it under Windows PowerShell 5.1.
+- `install.sh` also recognises Termux by its `$PREFIX`.
+
+### Fixed
+
+- Episodes without a title no longer leave trailing spaces in the picker and `--list`.
+
 ## [1.0.0] - 2026-11-01
 
 ### Added
