@@ -40,10 +40,13 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -329,7 +332,8 @@ def load_anime(slug):
         raise
     if not d:
         return None
-    return d["anime"], d.get("episodes") or []
+    anime = dict(d["anime"], _slug=slug)        # watch history is keyed by the slug
+    return anime, d.get("episodes") or []
 
 
 def parse_url(s):
@@ -507,6 +511,85 @@ mp.add_hook("on_preloaded", 50, function()
 end)
 """
 
+# many files mark the opening and the ending as chapters, under all sorts of names.
+# this mpv script jumps past the opening, and from the ending (or the preview) straight
+# to the next episode. files without chapters just play through.
+CHAPTER_SKIPPER = """\
+-- written by reanime: skip openings, and go from the ending to the next episode
+-- titles seen on reanime's files: "Opening Song", "Intro", "To Be Continued & Ending
+-- Song", "Credits", "On The Next episode". whole words only, so "Introduction" stays.
+-- openings are matched first, so "Opening Credits" is an opening
+local OPENING = {"opening", "intro", "op%d*"}
+local ENDING = {"ending", "credits", "outro", "ed%d*", "preview", "next episode", "next time"}
+
+local function matches(title, words)
+    title = title:lower()
+    for _, w in ipairs(words) do
+        if title:find("%f[%w]" .. w .. "%f[%W]") then return true end
+    end
+    return false
+end
+
+local function kind(c)
+    local title = c and c.title or ""
+    if matches(title, OPENING) then return "opening" end
+    if matches(title, ENDING) then return "ending" end
+end
+
+local skipped = {}      -- "path#chapter" skipped once already: seeking back plays it
+local at, opened        -- the chapter playing now, and the file it started in
+local waiting = false   -- reached an ending before the next episode was queued
+
+local function next_episode()
+    local pos = mp.get_property_number("playlist-pos", 0)
+    waiting = pos + 1 >= mp.get_property_number("playlist-count", 0)
+    if not waiting then
+        mp.msg.info("ending: next episode")
+        mp.osd_message("skipped the ending  (< to go back)", 3)
+        mp.command("playlist-next")
+    end
+end
+
+local function check()
+    local path, ch = mp.get_property("path"), mp.get_property_number("chapter")
+    local key = path and ch and (path .. "#" .. ch)
+    if key == at then return end
+    at, waiting = key, false
+    if not key then return end
+    local list = mp.get_property_native("chapter-list") or {}
+    local c, first = list[ch + 1], opened ~= path
+    opened = path
+    local what = kind(c)
+    if not what or skipped[key] then return end
+    -- skip a chapter playback runs into, or one a file opens in (a resume), but not
+    -- one the viewer seeks into the middle of
+    local pos = mp.get_property_number("time-pos")
+    if not first and pos and pos > c.time + 2 then return end
+    skipped[key] = true
+    if what == "ending" then return next_episode() end
+    local after = list[ch + 2]
+    if after then
+        mp.msg.info("skipped " .. c.title)
+        mp.osd_message("skipped " .. c.title .. "  (PgDn to watch it)", 3)
+        mp.commandv("seek", after.time, "absolute+exact")
+    end
+end
+
+-- where the ending starts, for reanime to count quitting during it as watched
+mp.register_event("file-loaded", function()
+    local start = 0
+    for _, c in ipairs(mp.get_property_native("chapter-list") or {}) do
+        if kind(c) == "ending" then start = c.time break end
+    end
+    mp.set_property_native("user-data/reanime/ending", start)
+    check()
+end)
+mp.observe_property("chapter", "number", check)
+mp.observe_property("playlist-count", "number", function()
+    if waiting then next_episode() end
+end)
+"""
+
 
 def cache_dir():
     """per-user cache folder. not the temp folder: other users can write there, and a
@@ -520,22 +603,33 @@ def cache_dir():
     return os.path.join(base, "reanime")
 
 
-def sub_picker():
-    """write SUB_PICKER where mpv can load it. its path, or None if it can't be written."""
-    path = os.path.join(cache_dir(), "pick-subs.lua")
+def mpv_script(name, source):
+    """write an mpv script into the cache folder (only when it changed).
+    its path, or None if it can't be written."""
+    path = os.path.join(cache_dir(), name)
     try:
         with open(path, encoding="utf-8") as fh:
-            if fh.read() == SUB_PICKER:
+            if fh.read() == source:
                 return path
     except (OSError, ValueError):
         pass
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(SUB_PICKER)
+            fh.write(source)
     except OSError:
         return None
     return path
+
+
+def sub_picker():
+    return mpv_script("pick-subs.lua", SUB_PICKER)
+
+
+def skip_args():
+    """mpv options that load CHAPTER_SKIPPER, or none if it can't be written."""
+    path = mpv_script("skip-chapters.lua", CHAPTER_SKIPPER)
+    return [f"--script={path}"] if path else []
 
 
 def mpv_args(lang):
@@ -574,41 +668,319 @@ def launch(cmd, url, title, lang):
         subprocess.run([*cmd, f"--force-media-title={title}", *mpv_args(lang), url])
 
 
-def play_range(cmd, anime, eps, lang):
-    """play eps back to back as mpv playlists of CHUNK episodes. links expire after
-    six hours, so each chunk is resolved while the one before it plays."""
+# ------------------------------------------------------------------ history
+# where each show was left off, and the last volume, so plain `reanime` can offer
+# "continue ONE PIECE 1155 at 12:34" and mpv reopens as loud as it was.
+
+def state_dir():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "reanime")
+
+
+def load_history():
+    try:
+        with open(os.path.join(state_dir(), "history.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember(anime, ep, lang, pos=None, volume=None):
+    """note where anime was left off: pos seconds into ep, or None once ep was watched.
+    history is a convenience, so a failed write never stops playback."""
+    data = load_history()
+    slug = anime.get("_slug")
+    if slug:
+        shows = data.get("shows") if isinstance(data.get("shows"), dict) else {}
+        shows[slug] = {"title": title_of(anime.get("title")), "lang": lang,
+                       "episode": str(epnum(ep)),
+                       "position": None if pos is None else round(pos, 1),
+                       "time": int(time.time())}
+        data["shows"], data["last"] = shows, slug
+    if isinstance(volume, (int, float)):
+        data["volume"] = round(volume)
+    path = os.path.join(state_dir(), "history.json")
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def resume_point(anime, eps, lang, history):
+    """(index into eps, start seconds) to carry on with anime in lang, or None.
+    start is None when the saved episode was the newest and already watched."""
+    h = (history.get("shows") or {}).get(anime.get("_slug"))
+    if not isinstance(h, dict) or h.get("lang") != lang:
+        return None
+    for i, ep in enumerate(eps):
+        if str(epnum(ep)) == h.get("episode"):
+            pos = h.get("position")
+            if isinstance(pos, (int, float)):
+                return i, float(pos)
+            return (i + 1, 0.0) if i + 1 < len(eps) else (i, None)
+    return None
+
+
+def clock(sec):
+    sec = int(sec or 0)
+    h, m, s = sec // 3600, sec // 60 % 60, sec % 60
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+# ------------------------------------------------------------------ binge sessions
+# on desktop one mpv window plays a whole binge. reanime talks to it over mpv's JSON
+# IPC and appends the next episode while the current one plays, so episodes advance
+# on their own, Enter or > (mpv's playlist-next) skips ahead, < goes back, and volume
+# and fullscreen carry over. links are fetched one episode ahead, so none is older
+# than about one episode when mpv opens it (they expire after six hours).
+
+POLL = 1.0       # seconds between looks at mpv's playlist position
+DONE_AT = 120    # quitting this close to the end, or once the ending starts (when the
+                 # file marks it as a chapter), counts as watched
+
+
+class MpvError(Exception):
+    pass
+
+
+class MpvIpc:
+    """mpv's JSON IPC, one request at a time. nothing reads in the background: a
+    Windows pipe handle serializes reads and writes, so a pending read would block
+    every command."""
+
+    def __init__(self, conn):
+        self.conn, self.buf, self.rid = conn, b"", 0
+        if isinstance(conn, socket.socket):
+            self.send, self.recv = conn.sendall, lambda: conn.recv(65536)
+        else:
+            self.send, self.recv = conn.write, lambda: conn.read(65536)
+
+    def command(self, *args, **named):
+        """run an mpv command, positional (["seek", 10]) or named (name=..., url=...)."""
+        self.rid += 1
+        cmd = dict(name=args[0], **named) if named else list(args)
+        self.send((json.dumps({"command": cmd, "request_id": self.rid}) + "\n").encode())
+        while True:
+            while b"\n" not in self.buf:
+                chunk = self.recv()
+                if not chunk:
+                    raise EOFError("mpv closed the connection")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            msg = json.loads(line)
+            if msg.get("request_id") == self.rid:
+                if msg.get("error") != "success":
+                    raise MpvError(msg.get("error"))
+                return msg.get("data")
+
+    def get(self, prop):
+        try:
+            return self.command("get_property", prop)
+        except MpvError:                # "property unavailable" while a file loads
+            return None
+
+    def close(self):
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
+def ipc_path():
+    tag = f"reanime-{os.getpid()}-{secrets.token_hex(4)}"
+    if os.name == "nt":
+        return "\\\\.\\pipe\\" + tag
+    # a private folder: whoever can open the socket can make mpv run commands
+    os.makedirs(cache_dir(), mode=0o700, exist_ok=True)
+    return os.path.join(cache_dir(), tag + ".sock")
+
+
+def mpv_connect(path, proc, timeout=15):
+    """connect to the ipc server of the mpv that proc runs, or None if it never opens
+    one (an mpv without ipc, or a flatpak sandbox that can't reach the path)."""
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None and time.monotonic() < deadline:
+        conn = None
+        try:
+            if os.name == "nt":
+                conn = open(path, "r+b", buffering=0)
+            else:
+                conn = socket.socket(socket.AF_UNIX)
+                conn.settimeout(10)
+                conn.connect(path)
+            ipc = MpvIpc(conn)
+            ipc.command("disable_event", "all")     # replies only, no event chatter
+            return ipc
+        except (OSError, EOFError, MpvError, ValueError):
+            if conn is not None:
+                conn.close()
+            time.sleep(0.1)
+    return None
+
+
+def in_background(fn, *args):
+    """run fn on a daemon thread (never holds up exit). -> (thread, box with ok/err)."""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn(*args)
+        except Exception as e:
+            box["err"] = e
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th, box
+
+
+def title_option(title):
+    # mpv's %bytes% quoting keeps commas and quotes in the title intact
+    return f"force-media-title=%{len(title.encode())}%{title}"
+
+
+def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
+    """play eps[idx] from start seconds in one mpv window, appending every following
+    episode (through eps[stop], else the newest) while the one before it plays.
+
+    returns (index, seconds, status) for where the viewer left off. status is "done"
+    (watched to the end, or mpv couldn't be followed), "stopped" (quit mid-episode at
+    seconds), "failed" (eps[idx] couldn't be resolved) or "quit" (Ctrl+C)."""
     name = title_of(anime.get("title"))
-    chunks = [eps[i:i + CHUNK] for i in range(0, len(eps), CHUNK)]
-    with ThreadPoolExecutor(1) as ahead:
-        nxt = ahead.submit(resolve_many, anime, chunks[0], lang)
-        for i in range(len(chunks)):
-            resolved = nxt.result()
-            if i + 1 < len(chunks):
-                nxt = ahead.submit(resolve_many, anime, chunks[i + 1], lang, True)
-            if not resolved:
-                continue
-            # --{ ... --} scopes an option to the files inside it: one title per episode,
-            # and no temp playlist file (a flatpak mpv can't see the host's /tmp)
-            files = []
-            for ep, url, _ in resolved:
-                files += ["--{", f"--force-media-title={ep_title(name, ep)}", url, "--}"]
-            first, last = epnum(resolved[0][0]), epnum(resolved[-1][0])
-            sys.stderr.write(f"{name} {first}-{last}  ({lang}, {len(resolved)} episodes)\n")
-            subprocess.run([*cmd, *mpv_args(lang), *files])
-            if i + 1 < len(chunks):
-                more = f"{epnum(chunks[i + 1][0])}-{epnum(chunks[i + 1][-1])}"
+    last = len(eps) - 1 if stop is None else stop
+    try:
+        url, video = resolve(anime, eps[idx], lang)
+    except (LookupError, RuntimeError, OSError, ValueError, KeyError) as e:
+        sys.stderr.write(f"episode {epnum(eps[idx])}: {e}\n")
+        return idx, None, "failed"
+    title = ep_title(name, eps[idx])
+    sys.stderr.write(f"{title}  ({lang}, {video.get('sizeHuman', '?')})\n")
+
+    path = ipc_path()
+    argv = [*cmd, *mpv_args(lang), f"--input-ipc-server={path}"]
+    volume = load_history().get("volume")
+    if isinstance(volume, (int, float)):
+        argv.append(f"--volume={volume:g}")
+    first = [f"--force-media-title={title}"] + ([f"--start={start:.1f}"] if start else [])
+    proc = subprocess.Popen([*argv, "--{", *first, url, "--}"])   # per-file options
+
+    queue = [idx]                     # mpv playlist entry -> index into eps
+    cur, pos, dur, vol, status = idx, (start or None), None, None, "done"
+    ending = None                     # where the ending starts, from CHAPTER_SKIPPER
+    nxt, pending, misses = idx + 1, None, 0
+    ipc = mpv_connect(path, proc)
+    try:
+        while ipc and proc.poll() is None:
+            try:
+                entry = ipc.get("playlist-pos")
+                t, d, v = ipc.get("time-pos"), ipc.get("duration"), ipc.get("volume")
+                e = ipc.get("user-data/reanime/ending")
+            except (EOFError, OSError, ValueError):
+                break                           # mpv is shutting down
+            if isinstance(entry, int) and 0 <= entry < len(queue):
+                if queue[entry] != cur:
+                    cur, pos, dur, ending = queue[entry], None, None, None
+                if t is not None:
+                    pos, dur = t, d
+                    ending = e if isinstance(e, (int, float)) and e > 0 else None
+            if v is not None:
+                vol = v
+            # keep one episode queued past the one playing
+            if pending is None and entry == len(queue) - 1 and nxt <= last and misses < 3:
+                pending = in_background(resolve, anime, eps[nxt], lang, False)
+            if pending is not None and not pending[0].is_alive():
+                nxt_title = ep_title(name, eps[nxt])
                 try:
-                    if menu_pick([(f"continue with {more}", True), ("quit", False)], 0,
-                                 f"\n{name} {first}-{last} done:") == 1:
-                        nxt.cancel()
-                        return
-                except EOFError:
-                    return
+                    if "err" in pending[1]:
+                        raise pending[1]["err"]
+                    ipc.command("loadfile", url=pending[1]["ok"][0], flags="append",
+                                options=title_option(nxt_title))
+                    ipc.command("print-text", f"reanime: up next  {nxt_title}")
+                    queue.append(nxt)
+                    misses = 0
+                except (LookupError, RuntimeError, OSError, ValueError, KeyError, MpvError) as e:
+                    misses += 1
+                    try:
+                        ipc.command("print-text", f"reanime: skipping episode {epnum(eps[nxt])}: {e}")
+                    except (EOFError, OSError, ValueError, MpvError):
+                        pass
+                nxt, pending = nxt + 1, None
+            time.sleep(POLL)
+    except KeyboardInterrupt:
+        status = "quit"
+    finally:
+        if ipc:
+            ipc.close()
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            proc.kill()
+            status = "quit"
+        if os.name != "nt" and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    watched = pos is not None and ((dur and dur - pos < DONE_AT) or (ending and pos >= ending))
+    if ipc and status == "done" and pos is not None and not watched:
+        status = "stopped"
+    seconds = pos if status in ("stopped", "quit") else None
+    remember(anime, eps[cur], lang, seconds, vol)
+    return cur, seconds, status
+
+
+def binge(cmd, anime, eps, idx, lang, start=0.0, stop=None):
+    """desktop playback: one mpv window per session, and a menu once it closes, with
+    resume as the default after quitting mid-episode and next after finishing one."""
+    name = title_of(anime.get("title"))
+    while True:
+        idx, pos, status = play_session(cmd, anime, eps, idx, lang, start, stop)
+        if status == "quit":
+            return
+        ep, start = eps[idx], 0.0
+        last = len(eps) - 1 if stop is None else stop
+        if status == "done" and idx >= last and stop is not None:
+            sys.stderr.write(f"\n{name} {epnum(eps[stop])}: end of the range\n")
+            return
+        opts = []
+        if status == "stopped":
+            opts.append((f"resume    {epnum(ep)} at {clock(pos)}", "resume"))
+        if idx + 1 < len(eps):
+            opts.append((f"next      {ep_label(eps[idx + 1]).strip()}", "next"))
+        if status != "failed":
+            opts.append(("replay" if status == "done" else f"restart   {epnum(ep)}", "replay"))
+        opts += [("pick episode", "pick"), ("quit", "quit")]
+        default = 0 if opts[0][1] in ("resume", "next") else len(opts) - 1
+        head = {"stopped": f"stopped at {clock(pos)}", "failed": "unavailable"}.get(status, "done")
+        try:
+            choice = opts[menu_pick(opts, default, f"\n{name} {epnum(ep)} {head}:")][1]
+        except EOFError:
+            return
+        if choice == "quit":
+            return
+        if choice == "resume":
+            start = pos
+        elif choice == "next":
+            idx += 1
+        elif choice == "pick":
+            ep = fuzzy_pick(eps, ep_label, f"{name} ({lang}):", noun="episodes", initial=idx)
+            if ep is None:
+                return
+            idx, stop = eps.index(ep), None
 
 
 def play_loop(cmd, anime, eps, idx, lang):
-    """play eps[idx], then offer next/replay/previous. the next episode is resolved
-    in the background while the current one plays, so Enter starts it right away."""
+    """Android (mpv-android takes one url at a time and can't be followed): open
+    eps[idx], then offer next/replay/previous. the next episode is resolved in the
+    background while the current one plays, so Enter starts it right away."""
     name = title_of(anime.get("title"))
     cache, pre = {}, None
 
@@ -638,6 +1010,7 @@ def play_loop(cmd, anime, eps, idx, lang):
             title = ep_title(name, ep)
             sys.stderr.write(f"{title}  ({lang}, {video.get('sizeHuman', '?')})\n")
             launch(cmd, url, title, lang)
+            remember(anime, ep, lang)       # the app reports nothing back: count it watched
 
         opts = []
         if idx + 1 < len(eps):
@@ -665,8 +1038,6 @@ def play_loop(cmd, anime, eps, idx, lang):
                 return
             idx = eps.index(ep)
 
-
-CHUNK = 8      # episodes per mpv run in range mode, about 3h of video
 
 # Termux on Android has no desktop for mpv to open a window on, so episodes go to
 # the mpv-android app through an intent instead (the same route ani-cli takes).
@@ -808,6 +1179,51 @@ def select_eps(eps, spec, lang):
     return picked, bool(m.group(2))
 
 
+def available(eps, lang):
+    return [ep for ep in eps if ep.get(FLAG[lang]) and ep.get("playable", True)]
+
+
+def continue_prompt():
+    """offer to carry on with the show watched last.
+    -> (anime, episodes in lang, lang, index, start seconds), or None to search."""
+    history = load_history()
+    slug = history.get("last")
+    h = (history.get("shows") or {}).get(slug) if isinstance(slug, str) else None
+    if not isinstance(h, dict) or h.get("lang") not in LANGS or not interactive_ok():
+        return None
+    got = load_anime(slug)
+    if not got:
+        return None
+    anime, lang = got[0], h["lang"]
+    eps = available(got[1], lang)
+    point = resume_point(anime, eps, lang, history)
+    if not point:
+        return None
+    i, start = point
+    name = title_of(anime.get("title"))
+    if start is None:
+        label = f"{name} ({lang}), caught up at {epnum(eps[i])}: pick an episode"
+    elif start:
+        label = f"{name} {epnum(eps[i])} ({lang}) at {clock(start)}"
+    else:
+        label = f"{name} {ep_label(eps[i]).strip()} ({lang})"
+    if menu_pick([(label, 0), ("search for something else", 1)], 0, "\ncontinue watching?"):
+        return None
+    if start is None:
+        ep = fuzzy_pick(eps, ep_label, f"\n{name} ({lang}):", noun="episodes", initial=i)
+        if ep is None:
+            sys.exit("cancelled")
+        i, start = eps.index(ep), 0.0
+    return anime, eps, lang, i, start
+
+
+def watch(cmd, anime, eps, idx, lang, start=0.0, stop=None):
+    if cmd is None:
+        play_loop(cmd, anime, eps, idx, lang)       # mpv-android
+    else:
+        binge(cmd, anime, eps, idx, lang, start, stop)
+
+
 def main():
     ap = argparse.ArgumentParser(description="stream anime from reanime.to in mpv")
     ap.add_argument("anime", nargs="?",
@@ -826,6 +1242,9 @@ def main():
                     help="write an .m3u playlist instead of launching mpv. links expire after "
                          "a few hours and only work from your current network")
     ap.add_argument("--mpv", default="mpv", help="path to mpv binary")
+    ap.add_argument("--no-skip", action="store_true",
+                    help="don't skip openings and endings (skipped when the file marks "
+                         "them as chapters)")
     ap.add_argument("--setup", action="store_true",
                     help="find or install mpv and exit (the installers run this)")
     ap.add_argument("-y", "--yes", action="store_true",
@@ -847,6 +1266,14 @@ def main():
     # check the player before any searching, so a first run sets everything up front
     playing = not (args.list or args.print_only or args.m3u is not None)
     cmd = ensure_player(args.mpv, args.yes) if playing else None
+    if cmd and not args.no_skip:
+        cmd = [*cmd, *skip_args()]
+
+    if playing and not (args.anime or args.episode or args.dub or args.sub):
+        cont = continue_prompt()
+        if cont:
+            watch(cmd, *cont)
+            return
 
     slug, url_ep, url_lang = parse_url(args.anime or "")
     spec = args.episode or url_ep
@@ -862,6 +1289,8 @@ def main():
             print(f"{have}  {ep_label(ep)}")
         return
 
+    history = load_history() if playing else {}
+    seen = (history.get("shows") or {}).get(anime.get("_slug")) or {}
     lang = "dub" if args.dub else "sub" if args.sub else url_lang
     if not lang:
         counts = {lg: sum(1 for ep in eps if ep.get(FLAG[lg])) for lg in ("dub", "sub")}
@@ -873,19 +1302,26 @@ def main():
             lang = "sub" if counts["sub"] else "dub"
         else:
             print(f"\n{name}")
-            lang = opts[menu_pick(opts, 0, "\naudio:")][1]
+            last_lang = [i for i, (_, lg) in enumerate(opts) if lg == seen.get("lang")]
+            lang = opts[menu_pick(opts, (last_lang or [0])[0], "\naudio:")][1]
 
-    avail = [ep for ep in eps if ep.get(FLAG[lang]) and ep.get("playable", True)]
+    avail = available(eps, lang)
     if not avail:
         sys.exit(f"{name} has no {lang} episodes")
+    start = 0.0
     if spec:
         picked, is_range = select_eps(avail, spec, lang)
     else:
+        # open the picker on where this show was left off, else on the newest episode
+        point = resume_point(anime, avail, lang, history)
         ep = fuzzy_pick(avail, ep_label, f"\n{name} ({lang}):", noun="episodes",
-                        initial=len(avail) - 1)
+                        initial=point[0] if point else len(avail) - 1)
         if ep is None:
             sys.exit("cancelled")
         picked, is_range = [avail.index(ep)], False
+        if point and point[0] == picked[0] and point[1]:
+            start = point[1]
+            sys.stderr.write(f"resuming at {clock(start)}\n")
 
     if args.print_only or args.m3u is not None:
         resolved = resolve_many(anime, [avail[i] for i in picked], lang)
@@ -902,10 +1338,7 @@ def main():
         print(os.path.abspath(path))
         return
 
-    if is_range and cmd is not None:    # mpv-android takes one url at a time: loop there
-        play_range(cmd, anime, [avail[i] for i in picked], lang)
-    else:
-        play_loop(cmd, anime, avail, picked[0], lang)
+    watch(cmd, anime, avail, picked[0], lang, start, picked[-1] if is_range else None)
 
 
 if __name__ == "__main__":

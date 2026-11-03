@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/vashhdev/reanime/actions/workflows/ci.yml/badge.svg)](https://github.com/vashhdev/reanime/actions/workflows/ci.yml)
 
-Stream anime from [reanime.to](https://reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it. When it ends, press Enter for the next one, which is already lined up.
+Stream anime from [reanime.to](https://reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it, then the next one, and the next, in the same window, hands-free.
 
 Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: current One Piece dub episodes (Egghead onward) that [One Pace](https://github.com/vashhdev/onepace) hasn't covered yet. Works for any show reanime has.
 
@@ -10,8 +10,10 @@ Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: curre
 - **Runs everywhere** - Windows, macOS, Linux, Steam Deck, and Android (Termux + mpv-android).
 - **Zero dependencies** - pure Python standard library.
 - **Interactive picker** - type to filter, `↑`/`↓` to move, `Enter` to select.
-- **Binge mode** - the next episode resolves in the background while the current one plays.
-- **Ranges** - `1151-1160` plays straight through as mpv playlists.
+- **Binge mode** - one mpv window keeps going: the next episode is added to the playlist while the current one plays, so it starts on its own (or press `Enter` in mpv to skip ahead). Volume and fullscreen stay put.
+- **Skips openings and endings** - when the file marks them as chapters, mpv jumps past the opening, and from the ending straight into the next episode.
+- **Picks up where you left off** - quit mid-episode and `Enter` resumes it. Plain `reanime` offers "continue ONE PIECE 1155 at 12:34", and mpv reopens at your last volume.
+- **Ranges** - `1151-1160` plays exactly those, back to back.
 
 ## Install
 
@@ -60,10 +62,10 @@ Or just grab the single file and run `python reanime.py`. It works without insta
 ## Usage
 
 ```bash
-reanime                                   # search, pick audio + episode
+reanime                                   # continue where you left off, or search
 reanime "one piece"                       # skip the search prompt
-reanime "one piece" 1151 --dub            # play 1151, then next / replay / previous
-reanime "one piece" 1151-1160 --dub       # play the range straight through
+reanime "one piece" 1151 --dub            # play 1151, 1152, 1153... until you quit
+reanime "one piece" 1151-1160 --dub       # play just this range
 reanime "one piece" 1151- --dub           # 1151 through the newest dub
 reanime "https://reanime.to/watch/one-piece-xamk74?ep=1151&lang=dub"   # paste a url from the site
 reanime one-piece-xamk74 --list           # every episode: S/D availability, filler tags
@@ -75,7 +77,8 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | Where                   | Keys                                                                   |
 | ----------------------- | ---------------------------------------------------------------------- |
 | Anime / episode picker  | type to narrow · `↑`/`↓` move · `Enter` select · `Esc` cancel          |
-| Audio, after-episode menu | press the number · `Enter` for the default (dub, next episode)       |
+| Audio, after-mpv menu   | press the number · `Enter` for the default (your last audio, resume or next episode) |
+| In mpv                  | `Enter` or `>` next episode · `<` previous · `PgDn` watch a skipped opening · `q` stop (reanime then offers to resume) |
 
 ### Flags
 
@@ -87,14 +90,17 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | `--print`       | print stream urls, don't launch a player                          |
 | `--m3u [PATH]`  | write an `.m3u` playlist instead. Links expire after 6 hours and only work from your current network |
 | `--mpv PATH`    | path to the mpv binary (default: found automatically)             |
+| `--no-skip`     | play openings and endings instead of skipping them                |
 | `--setup`       | find or install mpv, then exit                                    |
 | `-y`, `--yes`   | install mpv without asking if it's missing (scripts, CI)          |
 
 ### mpv tips
 
 - `#` cycles audio tracks (dub / Japanese on dual-audio files), `j` cycles subtitles. Dub mode starts with subtitles off. Many files have an English `Forced` track that only translates on-screen signs, which is handy with the dub.
-- Sub mode picks the full English subtitles by track name. Some files mark the episode-title card or a signs-only track as the default English subtitles, which mpv alone would show. reanime handles this with a small mpv script it keeps in your cache folder (`%LOCALAPPDATA%\reanime` on Windows, `~/Library/Caches/reanime` on macOS, `~/.cache/reanime` on Linux).
-- In a range, `<` / `>` go to the previous / next episode. Ranges play in batches of 8 episodes, and reanime asks before starting the next batch.
+- Sub mode picks the full English subtitles by track name. Some files mark the episode-title card or a signs-only track as the default English subtitles, which mpv alone would show. reanime handles this with a small mpv script it keeps in your cache folder, next to the one that skips openings and endings (`%LOCALAPPDATA%\reanime` on Windows, `~/Library/Caches/reanime` on macOS, `~/.cache/reanime` on Linux).
+- Episodes queue up one at a time, so `Enter` right after an episode starts may need a second press once the next one is in (a couple of seconds).
+- The opening and ending skip goes by chapter names ("Opening Song", "Intro", "Ending Song", "Credits", "Preview" and the like), so it only works on files that have chapters. Of the One Piece episodes checked, 1 and 1151 have them and 500 doesn't, so it just plays through. `PgDn` right after a skip goes back to the opening, and it won't be skipped again. The ending skip also skips anything after the credits, such as the next-episode preview; `<` goes back to the previous episode, which then plays in full. Quitting during an ending counts as watched.
+- Where you left off is kept in `%APPDATA%\reanime\history.json` on Windows (`~/Library/Application Support/reanime` on macOS, `~/.local/state/reanime` on Linux). Delete it to forget everything.
 - **mpv-android:** the app picks the audio and subtitle tracks itself. For dub-by-default, add `alang=eng` under Settings > Advanced > Edit mpv.conf. If a sub episode only shows the episode title, switch to the "Full Subtitles" track from the subtitle button.
 
 ## How it works
@@ -104,11 +110,11 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 3. Gets a direct `.mkv` link from flixcloud's download page, waiting until flixcloud marks the file ready (usually instant).
 4. mpv streams that link with range requests, so seeking works and nothing is saved to disk. Many files are dual audio, so `--dub`/`--sub` just tell mpv which audio track to use, and in sub mode which English subtitle track is the full one.
 
-Links are tied to your IP address and expire after 6 hours, so a range is fetched in batches, each while the previous one plays.
+Links are tied to your IP address and expire after 6 hours, so reanime never fetches far ahead: it keeps mpv open with its JSON IPC (a named pipe on Windows, a socket elsewhere) and adds each next episode to the playlist while the one before it plays. mpv-android can't be driven that way, so on Android reanime opens one episode at a time and asks what's next.
 
 ## Development
 
-The tests run offline against fixtures shaped like the real site responses, so they need no network and no mpv:
+The tests run offline against fixtures shaped like the real site responses, so they need no network. Three of them also drive a real mpv (the subtitle picker, a whole binge session, and the opening and ending skip) when one is installed, and are skipped otherwise:
 
 ```bash
 python -m unittest discover -s tests -v

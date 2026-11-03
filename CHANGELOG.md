@@ -7,6 +7,19 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- **One mpv window for the whole binge.** reanime drives mpv over its JSON IPC and
+  adds the next episode to the playlist while the current one plays: episodes
+  advance on their own, `Enter` / `>` in mpv skips ahead, `<` goes back, and volume
+  and fullscreen stay put. Ranges work the same way instead of batches of 8.
+- **Resume.** Quitting mid-episode makes "resume at 12:34" the menu's default. Plain
+  `reanime` offers to continue the last show where you stopped, `reanime "one piece"`
+  opens the picker on it with your last audio choice, and mpv reopens at the volume
+  you last used.
+- **Opening and ending skip.** When a file marks them as chapters (One Piece 1 and
+  1151 do, 500 doesn't), mpv jumps past the opening, and from the ending or the preview
+  straight to the next episode. `PgDn` brings a skipped opening back, quitting
+  during the ending counts as watched, and `--no-skip` turns it off.
+
 - **CI pipeline** (GitHub Actions): lint, offline tests on Windows/macOS/Linux with
   Python 3.8 and 3.13, package build, the real installers on fresh machines (plus
   Termux in Docker), a daily live check against reanime.to, and tag-driven releases.

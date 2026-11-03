@@ -117,8 +117,12 @@ jobs:
           mpv="${ready#ready: }"
           # unquoted on purpose: "flatpak run io.mpv.Mpv" has to split into words
           $mpv --vo=null --ao=null --frames=10 av://lavfi:testsrc=duration=1
-          # sub mode's Lua subtitle picker works in this mpv build
-          REANIME_TEST_MPV="$mpv" python3 -m unittest -v tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track
+          # this mpv build runs the sub-mode Lua picker, a whole binge session (episodes
+          # appended over its IPC socket while one plays) and the chapter skipper
+          REANIME_TEST_MPV="$mpv" python3 -m unittest -v \
+            tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track \
+            tests.test_reanime.Session.test_real_mpv_plays_a_whole_session_in_one_window \
+            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending
       - name: reanime runs, mpv found and plays
         if: runner.os == 'Windows'
         shell: pwsh
@@ -130,9 +134,13 @@ jobs:
           $mpv = $ready -replace '^ready: ', ''
           & $mpv --vo=null --ao=null --frames=10 av://lavfi:testsrc=duration=1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          # sub mode's Lua subtitle picker works in this mpv build
+          # this mpv build runs the sub-mode Lua picker, a whole binge session (episodes
+          # appended over its IPC named pipe while one plays) and the chapter skipper
           $env:REANIME_TEST_MPV = $mpv
-          python -m unittest -v tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track
+          python -m unittest -v `
+            tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track `
+            tests.test_reanime.Session.test_real_mpv_plays_a_whole_session_in_one_window `
+            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   ok:
@@ -186,7 +194,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: search + episode list
-        run: python3 reanime.py "one piece" --list | tail -n 3
+        run: |
+          set -o pipefail
+          python3 reanime.py "one piece" --list | tail -n 3
       - name: mpv
         run: python3 reanime.py --setup --yes
       # both steps give mpv exactly the options reanime gives it (mpv_args)
