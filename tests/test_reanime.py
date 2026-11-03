@@ -26,16 +26,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import reanime  # noqa: E402
 
-# every test writes reanime's cache (the sub-mode mpv script) here, never the real one
+# every test writes reanime's cache (the sub-mode mpv script, ipc sockets) and its
+# watch history here, never into the real folders
 CACHE = None
 
 
 def setUpModule():
     global CACHE
     CACHE = tempfile.TemporaryDirectory()
-    patcher = mock.patch.object(reanime, "cache_dir", lambda: os.path.join(CACHE.name, "reanime"))
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    for name, sub in (("cache_dir", "reanime"), ("state_dir", "state")):
+        patcher = mock.patch.object(reanime, name, lambda sub=sub: os.path.join(CACHE.name, sub))
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
     unittest.addModuleCleanup(CACHE.cleanup)
 
 
@@ -452,31 +454,203 @@ class Playback(unittest.TestCase):
         self.assertEqual(opts[default][1], "quit")
         self.assertNotIn("next", [v for _, v in opts])
 
-    def test_range_plays_in_chunks_with_per_episode_titles(self):
-        eps = [{"number": n, "title": f"T{n}"} for n in range(1151, 1170)]
-        runs = []
-        resolve_many = lambda a, chunk, lang, quiet=False: [   # noqa: E731
-            (e, f"https://u/{e['number']}", {}) for e in chunk]
-        with mock.patch.object(reanime, "resolve_many", resolve_many), \
-                mock.patch.object(reanime.subprocess, "run", lambda c, **k: runs.append(c)), \
-                mock.patch.object(reanime, "menu_pick", return_value=0), \
-                contextlib.redirect_stderr(io.StringIO()):
-            reanime.play_range(["mpv"], ANIME, eps, "dub")
-        self.assertEqual([sum(a.startswith("https://") for a in r) for r in runs], [8, 8, 3])
-        self.assertEqual(runs[0][:6], ["mpv", "--alang=eng,en", "--sid=no", "--{",
-                                       "--force-media-title=ONE PIECE - 1151 - T1151",
-                                       "https://u/1151"])
 
-    def test_range_stops_when_user_quits(self):
-        eps = [{"number": n} for n in range(1, 20)]
-        runs = []
-        with mock.patch.object(reanime, "resolve_many",
-                               lambda a, chunk, lang, quiet=False: [(e, "https://u", {}) for e in chunk]), \
-                mock.patch.object(reanime.subprocess, "run", lambda c, **k: runs.append(c)), \
-                mock.patch.object(reanime, "menu_pick", return_value=1), \
+
+class FakeMpv:
+    """one mpv process plus its IPC connection. the playlist starts with the urls on
+    the command line; every file lasts `length` polls of `duration` seconds, then the
+    next one plays, or mpv exits after the last. `actions` maps a poll number to
+    "next" (Enter in mpv) or "quit" (q)."""
+
+    def __init__(self, argv, length=3, actions=None, duration=1400.0, volume=55.0):
+        self.argv = argv
+        self.playlist = [a for a in argv if a.startswith("https://")]
+        self.titles = [a.split("=", 1)[1] for a in argv if a.startswith("--force-media-title=")]
+        self.length, self.actions, self.duration, self.volume = length, actions or {}, duration, volume
+        self.pos, self.tick, self.polls, self.exited, self.printed = 0, 0, 0, False, []
+
+    # the process
+    def poll(self):
+        return 0 if self.exited else None
+
+    def wait(self):
+        self.exited = True
+        return 0
+
+    def kill(self):
+        self.exited = True
+
+    # the ipc connection
+    def get(self, prop):
+        if prop == "playlist-pos":
+            self.polls += 1
+            self.tick += 1
+            action = self.actions.get(self.polls)
+            if action == "next" or self.tick > self.length:
+                if self.pos + 1 >= len(self.playlist):
+                    self.exited = True
+                    raise EOFError
+                self.pos, self.tick = self.pos + 1, 1
+            if action == "quit":
+                self.exited = True
+                raise EOFError
+            return self.pos
+        return {"time-pos": self.duration * self.tick / self.length, "duration": self.duration,
+                "volume": self.volume}[prop]
+
+    def command(self, *args, **named):
+        if named.get("name", args[0] if args else None) == "loadfile" or args[:1] == ("loadfile",):
+            self.playlist.append(named["url"])
+            self.titles.append(named["options"].split("%", 2)[2])
+        elif args[:1] == ("print-text",):
+            self.printed.append(args[1])
+
+    def close(self):
+        pass
+
+
+class Session(unittest.TestCase):
+    """the desktop binge: one mpv window, next episode appended while one plays."""
+    eps = [{"number": n, "title": f"T{n}"} for n in (1, 2, 3)]
+    anime = dict(ANIME, _slug="one-piece-xamk74")
+
+    def run_session(self, idx=0, stop=None, start=0.0, resolve=fake_resolve, **fake):
+        mpvs = []
+
+        def popen(argv):
+            mpvs.append(FakeMpv(argv, **fake))
+            return mpvs[-1]
+        with mock.patch.object(reanime, "resolve", resolve), \
+                mock.patch.object(reanime.subprocess, "Popen", popen), \
+                mock.patch.object(reanime, "mpv_connect", lambda path, proc: proc), \
+                mock.patch.object(reanime, "POLL", 0.001), \
                 contextlib.redirect_stderr(io.StringIO()):
-            reanime.play_range(["mpv"], ANIME, eps, "dub")
-        self.assertEqual(len(runs), 1)
+            out = reanime.play_session(["mpv"], self.anime, self.eps, idx, "dub", start, stop)
+        self.assertEqual(len(mpvs), 1)          # one window for the whole session
+        return out, mpvs[0]
+
+    def test_plays_every_episode_in_one_window(self):
+        (idx, pos, status), mpv = self.run_session()
+        self.assertEqual(mpv.playlist, ["https://u/1", "https://u/2", "https://u/3"])
+        self.assertEqual(mpv.titles, ["ONE PIECE - 1 - T1", "ONE PIECE - 2 - T2",
+                                      "ONE PIECE - 3 - T3"])
+        self.assertEqual((idx, pos, status), (2, None, "done"))
+        self.assertIn("--{", mpv.argv)          # first file's title is file-local
+        self.assertTrue(any(a.startswith("--input-ipc-server=") for a in mpv.argv))
+        h = reanime.load_history()
+        self.assertEqual((h["last"], h["shows"]["one-piece-xamk74"]["episode"], h["volume"]),
+                         ("one-piece-xamk74", "3", 55))
+        self.assertIsNone(h["shows"]["one-piece-xamk74"]["position"])
+
+    def test_quit_mid_episode_is_remembered_with_position_and_volume(self):
+        (idx, pos, status), _ = self.run_session(actions={5: "quit"}, volume=72.0)
+        self.assertEqual((idx, status), (1, "stopped"))          # quit 1/3 into episode 2
+        self.assertAlmostEqual(pos, 1400 / 3, places=1)
+        h = reanime.load_history()
+        self.assertEqual(h["shows"]["one-piece-xamk74"]["episode"], "2")
+        self.assertEqual(h["volume"], 72)
+        # the next run opens mpv at that volume, and a resume starts at the position
+        (_, _, _), mpv = self.run_session(idx=1, start=466.7, actions={2: "quit"})
+        self.assertIn("--volume=72", mpv.argv)
+        self.assertIn("--start=466.7", mpv.argv)
+
+    def test_enter_skips_ahead_and_range_stops_at_its_end(self):
+        (idx, _, status), mpv = self.run_session(stop=1, actions={3: "next"})
+        self.assertEqual(mpv.playlist, ["https://u/1", "https://u/2"])     # nothing past 2
+        self.assertEqual((idx, status), (1, "done"))
+
+    def test_unresolvable_next_episode_is_skipped(self):
+        def flaky(anime, ep, lang, verbose=True):
+            if str(reanime.epnum(ep)) == "2":
+                raise LookupError("no dub source for episode 2")
+            return fake_resolve(anime, ep, lang)
+        (idx, _, _), mpv = self.run_session(resolve=flaky)
+        self.assertEqual(mpv.playlist, ["https://u/1", "https://u/3"])
+        self.assertTrue(any("skipping episode 2" in p for p in mpv.printed))
+
+    def test_without_ipc_it_still_plays_the_first_episode(self):
+        with mock.patch.object(reanime, "mpv_connect", lambda path, proc: None), \
+                mock.patch.object(reanime, "resolve", fake_resolve), \
+                mock.patch.object(reanime.subprocess, "Popen", lambda argv: FakeMpv(argv)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(reanime.play_session(["mpv"], self.anime, self.eps, 0, "dub"),
+                             (0, None, "done"))
+
+    def test_menu_resumes_by_default_after_quitting_mid_episode(self):
+        sessions, menus = [(1, 754.0, "stopped"), (1, None, "quit")], []
+        calls = []
+
+        def session(cmd, anime, eps, idx, lang, start, stop):
+            calls.append((idx, start))
+            return sessions.pop(0)
+
+        def menu(opts, default, header):
+            menus.append((opts, default, header))
+            return default
+        with mock.patch.object(reanime, "play_session", session), \
+                mock.patch.object(reanime, "menu_pick", menu):
+            reanime.binge(["mpv"], self.anime, self.eps, 0, "dub")
+        opts, default, header = menus[0]
+        self.assertEqual(opts[default][1], "resume")
+        self.assertIn("stopped at 12:34", header)
+        self.assertEqual(calls, [(0, 0.0), (1, 754.0)])
+
+    def test_resume_point_and_continue_prompt(self):
+        eps = [{"number": n, "dubbed": True} for n in (1154, 1155, 1156)]
+        hist = {"last": "one-piece-xamk74", "shows": {"one-piece-xamk74": {
+            "lang": "dub", "episode": "1155", "position": 754.0}}}
+        self.assertEqual(reanime.resume_point(self.anime, eps, "dub", hist), (1, 754.0))
+        self.assertIsNone(reanime.resume_point(self.anime, eps, "sub", hist))
+        hist["shows"]["one-piece-xamk74"]["position"] = None            # watched: next one
+        self.assertEqual(reanime.resume_point(self.anime, eps, "dub", hist), (2, 0.0))
+        hist["shows"]["one-piece-xamk74"]["episode"] = "1156"           # newest: caught up
+        self.assertEqual(reanime.resume_point(self.anime, eps, "dub", hist), (2, None))
+
+        reanime.remember(self.anime, eps[1], "dub", 754.0)
+        labels = []
+        with mock.patch.object(reanime, "load_anime", lambda slug: (self.anime, eps)), \
+                mock.patch.object(reanime, "interactive_ok", lambda: True), \
+                mock.patch.object(reanime, "menu_pick",
+                                  lambda opts, d, h: labels.append(opts[0][0]) or 0):
+            anime, got_eps, lang, idx, start = reanime.continue_prompt()
+        self.assertEqual((lang, idx, start), ("dub", 1, 754.0))
+        self.assertEqual(labels, ["ONE PIECE 1155 (dub) at 12:34"])
+
+    def test_history_survives_a_corrupt_file(self):
+        os.makedirs(reanime.state_dir(), exist_ok=True)
+        with open(os.path.join(reanime.state_dir(), "history.json"), "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(reanime.load_history(), {})
+        reanime.remember(self.anime, self.eps[0], "sub", 10.0)
+        self.assertEqual(reanime.load_history()["shows"]["one-piece-xamk74"]["lang"], "sub")
+
+    def test_clock(self):
+        self.assertEqual([reanime.clock(s) for s in (0, 754, 3723)], ["0:00", "12:34", "1:02:03"])
+
+    def test_real_mpv_plays_a_whole_session_in_one_window(self):
+        # three generated 2s "episodes" through a real mpv and its IPC (pipe or socket).
+        # REANIME_TEST_MPV makes this mandatory (CI's install stage)
+        forced = os.environ.get("REANIME_TEST_MPV")
+        cmd = [forced] if forced else reanime.find_mpv("mpv")
+        if not cmd:
+            self.skipTest("mpv not installed")
+        sent = []
+        real_command = reanime.MpvIpc.command
+
+        def spy(ipc, *args, **named):
+            sent.append(named.get("name") or args[0])
+            return real_command(ipc, *args, **named)
+
+        def lavfi(anime, ep, lang, verbose=True):
+            return f"av://lavfi:testsrc=duration=2:size=64x64:rate={10 + ep['number']}", {}
+        with mock.patch.object(reanime, "resolve", lavfi), \
+                mock.patch.object(reanime.MpvIpc, "command", spy), \
+                mock.patch.object(reanime, "POLL", 0.1), \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = reanime.play_session([*cmd, "--no-config", "--vo=null", "--ao=null",
+                                        "--really-quiet"], self.anime, self.eps, 0, "dub")
+        self.assertEqual(got, (2, None, "done"))
+        self.assertEqual(sent.count("loadfile"), 2)                    # 2 and 3 appended
 
 
 # ------------------------------------------------------------------ player setup
