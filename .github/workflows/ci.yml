@@ -194,7 +194,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: search + episode list
-        run: python3 reanime.py "one piece" --list | tail -n 3
+        run: |
+          set -o pipefail
+          python3 reanime.py "one piece" --list | tail -n 3
       - name: mpv
         run: python3 reanime.py --setup --yes
       # both steps give mpv exactly the options reanime gives it (mpv_args)
