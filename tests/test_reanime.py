@@ -637,6 +637,22 @@ class Session(unittest.TestCase):
         self.assertEqual((lang, idx, start), ("dub", 1, 754.0))
         self.assertEqual(labels, ["ONE PIECE 1155 (dub) at 12:34"])
 
+    def test_plain_reanime_continues_where_it_left_off(self):
+        # the whole path from `reanime` with no arguments to mpv: Enter on "continue"
+        # plays the saved episode from the saved position
+        eps = [{"number": n, "subbed": True} for n in (1, 2, 3)]
+        reanime.remember(self.anime, eps[0], "sub", 1181.0)
+        played = []
+        with mock.patch.object(reanime, "ensure_player", lambda mpv, yes: ["mpv"]), \
+                mock.patch.object(reanime, "load_anime", lambda slug: (self.anime, eps)), \
+                mock.patch.object(reanime, "interactive_ok", lambda: True), \
+                mock.patch.object(reanime, "menu_pick", lambda opts, default, header: default), \
+                mock.patch.object(reanime, "play_session",
+                                  lambda *a: played.append(a) or (0, None, "quit")):
+            code, _, err = run_main("--no-skip")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(played, [(["mpv"], self.anime, eps, 0, "sub", 1181.0, None)])
+
     def test_history_survives_a_corrupt_file(self):
         os.makedirs(reanime.state_dir(), exist_ok=True)
         with open(os.path.join(reanime.state_dir(), "history.json"), "w") as fh:

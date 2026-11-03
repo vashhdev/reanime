@@ -5,6 +5,13 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-03
+
+### Fixed
+
+- Plain `reanime` crashed on "continue watching?" (`TypeError: list indices must be
+  integers`): the episode and the language reached the player swapped.
+
 ## [1.1.0] - 2026-11-02
 
 ### Added
