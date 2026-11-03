@@ -511,6 +511,85 @@ mp.add_hook("on_preloaded", 50, function()
 end)
 """
 
+# many files mark the opening and the ending as chapters, under all sorts of names.
+# this mpv script jumps past the opening, and from the ending (or the preview) straight
+# to the next episode. files without chapters just play through.
+CHAPTER_SKIPPER = """\
+-- written by reanime: skip openings, and go from the ending to the next episode
+-- titles seen on reanime's files: "Opening Song", "Intro", "To Be Continued & Ending
+-- Song", "Credits", "On The Next episode". whole words only, so "Introduction" stays.
+-- openings are matched first, so "Opening Credits" is an opening
+local OPENING = {"opening", "intro", "op%d*"}
+local ENDING = {"ending", "credits", "outro", "ed%d*", "preview", "next episode", "next time"}
+
+local function matches(title, words)
+    title = title:lower()
+    for _, w in ipairs(words) do
+        if title:find("%f[%w]" .. w .. "%f[%W]") then return true end
+    end
+    return false
+end
+
+local function kind(c)
+    local title = c and c.title or ""
+    if matches(title, OPENING) then return "opening" end
+    if matches(title, ENDING) then return "ending" end
+end
+
+local skipped = {}      -- "path#chapter" skipped once already: seeking back plays it
+local at, opened        -- the chapter playing now, and the file it started in
+local waiting = false   -- reached an ending before the next episode was queued
+
+local function next_episode()
+    local pos = mp.get_property_number("playlist-pos", 0)
+    waiting = pos + 1 >= mp.get_property_number("playlist-count", 0)
+    if not waiting then
+        mp.msg.info("ending: next episode")
+        mp.osd_message("skipped the ending  (< to go back)", 3)
+        mp.command("playlist-next")
+    end
+end
+
+local function check()
+    local path, ch = mp.get_property("path"), mp.get_property_number("chapter")
+    local key = path and ch and (path .. "#" .. ch)
+    if key == at then return end
+    at, waiting = key, false
+    if not key then return end
+    local list = mp.get_property_native("chapter-list") or {}
+    local c, first = list[ch + 1], opened ~= path
+    opened = path
+    local what = kind(c)
+    if not what or skipped[key] then return end
+    -- skip a chapter playback runs into, or one a file opens in (a resume), but not
+    -- one the viewer seeks into the middle of
+    local pos = mp.get_property_number("time-pos")
+    if not first and pos and pos > c.time + 2 then return end
+    skipped[key] = true
+    if what == "ending" then return next_episode() end
+    local after = list[ch + 2]
+    if after then
+        mp.msg.info("skipped " .. c.title)
+        mp.osd_message("skipped " .. c.title .. "  (PgDn to watch it)", 3)
+        mp.commandv("seek", after.time, "absolute+exact")
+    end
+end
+
+-- where the ending starts, for reanime to count quitting during it as watched
+mp.register_event("file-loaded", function()
+    local start = 0
+    for _, c in ipairs(mp.get_property_native("chapter-list") or {}) do
+        if kind(c) == "ending" then start = c.time break end
+    end
+    mp.set_property_native("user-data/reanime/ending", start)
+    check()
+end)
+mp.observe_property("chapter", "number", check)
+mp.observe_property("playlist-count", "number", function()
+    if waiting then next_episode() end
+end)
+"""
+
 
 def cache_dir():
     """per-user cache folder. not the temp folder: other users can write there, and a
@@ -524,22 +603,33 @@ def cache_dir():
     return os.path.join(base, "reanime")
 
 
-def sub_picker():
-    """write SUB_PICKER where mpv can load it. its path, or None if it can't be written."""
-    path = os.path.join(cache_dir(), "pick-subs.lua")
+def mpv_script(name, source):
+    """write an mpv script into the cache folder (only when it changed).
+    its path, or None if it can't be written."""
+    path = os.path.join(cache_dir(), name)
     try:
         with open(path, encoding="utf-8") as fh:
-            if fh.read() == SUB_PICKER:
+            if fh.read() == source:
                 return path
     except (OSError, ValueError):
         pass
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(SUB_PICKER)
+            fh.write(source)
     except OSError:
         return None
     return path
+
+
+def sub_picker():
+    return mpv_script("pick-subs.lua", SUB_PICKER)
+
+
+def skip_args():
+    """mpv options that load CHAPTER_SKIPPER, or none if it can't be written."""
+    path = mpv_script("skip-chapters.lua", CHAPTER_SKIPPER)
+    return [f"--script={path}"] if path else []
 
 
 def mpv_args(lang):
@@ -654,7 +744,8 @@ def clock(sec):
 # than about one episode when mpv opens it (they expire after six hours).
 
 POLL = 1.0       # seconds between looks at mpv's playlist position
-DONE_AT = 120    # quitting this close to the end (ending, preview) counts as watched
+DONE_AT = 120    # quitting this close to the end, or once the ending starts (when the
+                 # file marks it as a chapter), counts as watched
 
 
 class MpvError(Exception):
@@ -782,6 +873,7 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
 
     queue = [idx]                     # mpv playlist entry -> index into eps
     cur, pos, dur, vol, status = idx, (start or None), None, None, "done"
+    ending = None                     # where the ending starts, from CHAPTER_SKIPPER
     nxt, pending, misses = idx + 1, None, 0
     ipc = mpv_connect(path, proc)
     try:
@@ -789,13 +881,15 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
             try:
                 entry = ipc.get("playlist-pos")
                 t, d, v = ipc.get("time-pos"), ipc.get("duration"), ipc.get("volume")
+                e = ipc.get("user-data/reanime/ending")
             except (EOFError, OSError, ValueError):
                 break                           # mpv is shutting down
             if isinstance(entry, int) and 0 <= entry < len(queue):
                 if queue[entry] != cur:
-                    cur, pos, dur = queue[entry], None, None
+                    cur, pos, dur, ending = queue[entry], None, None, None
                 if t is not None:
                     pos, dur = t, d
+                    ending = e if isinstance(e, (int, float)) and e > 0 else None
             if v is not None:
                 vol = v
             # keep one episode queued past the one playing
@@ -835,7 +929,8 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
             except OSError:
                 pass
 
-    if ipc and status == "done" and pos is not None and not (dur and dur - pos < DONE_AT):
+    watched = pos is not None and ((dur and dur - pos < DONE_AT) or (ending and pos >= ending))
+    if ipc and status == "done" and pos is not None and not watched:
         status = "stopped"
     seconds = pos if status in ("stopped", "quit") else None
     remember(anime, eps[cur], lang, seconds, vol)
@@ -1147,6 +1242,9 @@ def main():
                     help="write an .m3u playlist instead of launching mpv. links expire after "
                          "a few hours and only work from your current network")
     ap.add_argument("--mpv", default="mpv", help="path to mpv binary")
+    ap.add_argument("--no-skip", action="store_true",
+                    help="don't skip openings and endings (skipped when the file marks "
+                         "them as chapters)")
     ap.add_argument("--setup", action="store_true",
                     help="find or install mpv and exit (the installers run this)")
     ap.add_argument("-y", "--yes", action="store_true",
@@ -1168,6 +1266,8 @@ def main():
     # check the player before any searching, so a first run sets everything up front
     playing = not (args.list or args.print_only or args.m3u is not None)
     cmd = ensure_player(args.mpv, args.yes) if playing else None
+    if cmd and not args.no_skip:
+        cmd = [*cmd, *skip_args()]
 
     if playing and not (args.anime or args.episode or args.dub or args.sub):
         cont = continue_prompt()

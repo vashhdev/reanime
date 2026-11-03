@@ -6,8 +6,8 @@ offline tests for reanime.py: no network, stdlib only.
 the site is replaced by fixtures shaped like the real responses (SvelteKit
 __data.json in devalue encoding, the flix server list, flixcloud's prepare-progress
 event stream), so every step of the pipeline runs without touching reanime.to.
-one test plays tests/fixtures/partial-subs.mkv in a real mpv when one is installed,
-and is skipped otherwise.
+three tests drive a real mpv when one is installed (the sub picker, a whole binge
+session, the chapter skipper), and are skipped otherwise.
 """
 
 import contextlib
@@ -365,6 +365,16 @@ class Main(unittest.TestCase):
             code, out, _ = run_main("--setup")
         self.assertEqual((code, out.strip()), (0, "ready: /usr/bin/mpv"))
 
+    def test_chapter_skipper_loads_unless_no_skip(self):
+        played = []
+        with offline(), mock.patch.object(reanime, "ensure_player", lambda mpv, yes: ["mpv"]), \
+                mock.patch.object(reanime, "watch", lambda cmd, *rest: played.append(cmd)):
+            run_main("one piece", "1151", "--dub")
+            run_main("one piece", "1151", "--dub", "--no-skip")
+        skipper = os.path.join(CACHE.name, "reanime", "skip-chapters.lua")
+        self.assertEqual(played, [["mpv", f"--script={skipper}"], ["mpv"]])
+        self.assertEqual(read(skipper), reanime.CHAPTER_SKIPPER)
+
     def test_version_matches_pyproject_and_changelog(self):
         pyproject = read(os.path.join(ROOT, "pyproject.toml"))
         changelog = read(os.path.join(ROOT, "CHANGELOG.md"))
@@ -460,13 +470,15 @@ class FakeMpv:
     """one mpv process plus its IPC connection. the playlist starts with the urls on
     the command line; every file lasts `length` polls of `duration` seconds, then the
     next one plays, or mpv exits after the last. `actions` maps a poll number to
-    "next" (Enter in mpv) or "quit" (q)."""
+    "next" (Enter in mpv) or "quit" (q). `ending` is where the chapter skipper says
+    every file's ending starts (None: no chapters, or no skipper)."""
 
-    def __init__(self, argv, length=3, actions=None, duration=1400.0, volume=55.0):
+    def __init__(self, argv, length=3, actions=None, duration=1400.0, volume=55.0, ending=None):
         self.argv = argv
         self.playlist = [a for a in argv if a.startswith("https://")]
         self.titles = [a.split("=", 1)[1] for a in argv if a.startswith("--force-media-title=")]
         self.length, self.actions, self.duration, self.volume = length, actions or {}, duration, volume
+        self.ending = ending
         self.pos, self.tick, self.polls, self.exited, self.printed = 0, 0, 0, False, []
 
     # the process
@@ -496,7 +508,7 @@ class FakeMpv:
                 raise EOFError
             return self.pos
         return {"time-pos": self.duration * self.tick / self.length, "duration": self.duration,
-                "volume": self.volume}[prop]
+                "volume": self.volume, "user-data/reanime/ending": self.ending}[prop]
 
     def command(self, *args, **named):
         if named.get("name", args[0] if args else None) == "loadfile" or args[:1] == ("loadfile",):
@@ -553,6 +565,15 @@ class Session(unittest.TestCase):
         (_, _, _), mpv = self.run_session(idx=1, start=466.7, actions={2: "quit"})
         self.assertIn("--volume=72", mpv.argv)
         self.assertIn("--start=466.7", mpv.argv)
+
+    def test_quitting_during_the_ending_counts_as_watched(self):
+        # quit 2/3 into episode 1 (933s of 1400): past an ending marked at 900s...
+        (idx, pos, status), _ = self.run_session(actions={3: "quit"}, ending=900.0)
+        self.assertEqual((idx, pos, status), (0, None, "done"))
+        self.assertIsNone(reanime.load_history()["shows"]["one-piece-xamk74"]["position"])
+        # ...but not before it
+        (idx, pos, status), _ = self.run_session(actions={3: "quit"}, ending=1000.0)
+        self.assertEqual((idx, status), (0, "stopped"))
 
     def test_enter_skips_ahead_and_range_stops_at_its_end(self):
         (idx, _, status), mpv = self.run_session(stop=1, actions={3: "next"})
@@ -710,6 +731,76 @@ class SubPicker(unittest.TestCase):
         # control: plain --slang lands on the title card, the bug the picker fixes
         self.assertEqual(picked(["--slang=eng,en"]), ["Episode Name"])
         self.assertEqual(picked(reanime.mpv_args("sub")), ["Full Subtitles"])
+
+
+class ChapterSkip(unittest.TestCase):
+    """the mpv script that skips openings and goes from the ending to the next episode."""
+
+    def kind(self, title):
+        """CHAPTER_SKIPPER's matching, in Python: whole words, %d* = digits, opening first."""
+        for kind, table in (("opening", "OPENING"), ("ending", "ENDING")):
+            words = re.findall(r'"([^"]+)"', re.search(rf"local {table} = \{{(.*)\}}",
+                                                       reanime.CHAPTER_SKIPPER)[1])
+            if any(re.search(r"(?<![a-z0-9])" + w.replace("%d*", "[0-9]*") + r"(?![a-z0-9])",
+                             title.lower()) for w in words):
+                return kind
+        return None
+
+    def test_chapter_titles(self):
+        # chapter titles from reanime's One Piece files (episodes 1 and 1151), and others
+        for kind, titles in {
+            "opening": ["Opening Song", "Intro", "OP", "OP2", "Opening Credits"],
+            "ending": ["To Be Continued & Ending Song", "Credits", "On The Next episode",
+                       "ED", "End Credits", "Preview", "Next Time"],
+            None: ["Gol D Roger Speech", "Part A", "Episode Name", "Eyecatch", "Part C",
+                   "Scene 1", "Scene 5", "Introduction", "Prologue", "Edward", "Stop"],
+        }.items():
+            for title in titles:
+                self.assertEqual(self.kind(title), kind, title)
+
+    def test_real_mpv_skips_the_opening_and_the_ending(self):
+        # two "episodes" built from the fixture with mpv's edl://, one segment (and so
+        # one chapter) per part. REANIME_TEST_MPV makes this mandatory (CI's install stage)
+        forced = os.environ.get("REANIME_TEST_MPV")
+        cmd = [forced] if forced else reanime.find_mpv("mpv")
+        if not cmd:
+            self.skipTest("mpv not installed")
+        fixture = os.path.join(ROOT, "tests", "fixtures", "partial-subs.mkv")
+        source = f"%{len(fixture.encode())}%{fixture}"
+        layouts = {1: ("Gol D Roger Speech", "Opening Song", "Part A",
+                       "To Be Continued & Ending Song", "On The Next episode"),
+                   2: ("Scene 1", "Intro", "Scene 3", "Credits", "Scene 5")}
+
+        def edl(anime, ep, lang, verbose=True):
+            # 0.5s story, 1.5s opening, 0.5s story, 1.5s ending, 1.5s preview, and a tail:
+            # mpv drops an edl's last segment from this fixture
+            parts = zip(layouts[ep["number"]] + ("Tail",), (0.5, 1.5, 0.5, 1.5, 1.5, 0.5))
+            return "edl://" + ";".join(f"{source},start=0,length={n},title={t}"
+                                       for t, n in parts), {}
+
+        ending = []
+        real_get = reanime.MpvIpc.get
+
+        def spy(ipc, prop):
+            got = real_get(ipc, prop)
+            if prop == "user-data/reanime/ending" and got:
+                ending.append(got)
+            return got
+        log = os.path.join(CACHE.name, "skip.log")
+        with mock.patch.object(reanime, "resolve", edl), \
+                mock.patch.object(reanime.MpvIpc, "get", spy), \
+                mock.patch.object(reanime, "POLL", 0.1), \
+                contextlib.redirect_stderr(io.StringIO()):
+            got = reanime.play_session([*cmd, "--no-config", "--vo=null", "--ao=null",
+                                        "--really-quiet", f"--log-file={log}",
+                                        *reanime.skip_args()],
+                                       Session.anime, Session.eps, 0, "dub", stop=1)
+        said = re.findall(r"\[i\]\[skip_chapters\] (.*)", read(log))
+        # 1: opening skipped, then the ending goes to 2. 2: opening skipped, and with
+        # nothing queued after it, its ending plays
+        self.assertEqual(said, ["skipped Opening Song", "ending: next episode", "skipped Intro"])
+        self.assertEqual(got, (1, None, "done"))
+        self.assertIn(2.5, ending)          # where the ending starts, read over the IPC
 
 
 class Setup(unittest.TestCase):

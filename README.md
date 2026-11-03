@@ -11,6 +11,7 @@ Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: curre
 - **Zero dependencies** - pure Python standard library.
 - **Interactive picker** - type to filter, `↑`/`↓` to move, `Enter` to select.
 - **Binge mode** - one mpv window keeps going: the next episode is added to the playlist while the current one plays, so it starts on its own (or press `Enter` in mpv to skip ahead). Volume and fullscreen stay put.
+- **Skips openings and endings** - when the file marks them as chapters, mpv jumps past the opening, and from the ending straight into the next episode.
 - **Picks up where you left off** - quit mid-episode and `Enter` resumes it. Plain `reanime` offers "continue ONE PIECE 1155 at 12:34", and mpv reopens at your last volume.
 - **Ranges** - `1151-1160` plays exactly those, back to back.
 
@@ -77,7 +78,7 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | ----------------------- | ---------------------------------------------------------------------- |
 | Anime / episode picker  | type to narrow · `↑`/`↓` move · `Enter` select · `Esc` cancel          |
 | Audio, after-mpv menu   | press the number · `Enter` for the default (your last audio, resume or next episode) |
-| In mpv                  | `Enter` or `>` next episode · `<` previous · `q` stop (reanime then offers to resume) |
+| In mpv                  | `Enter` or `>` next episode · `<` previous · `PgDn` watch a skipped opening · `q` stop (reanime then offers to resume) |
 
 ### Flags
 
@@ -89,14 +90,16 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | `--print`       | print stream urls, don't launch a player                          |
 | `--m3u [PATH]`  | write an `.m3u` playlist instead. Links expire after 6 hours and only work from your current network |
 | `--mpv PATH`    | path to the mpv binary (default: found automatically)             |
+| `--no-skip`     | play openings and endings instead of skipping them                |
 | `--setup`       | find or install mpv, then exit                                    |
 | `-y`, `--yes`   | install mpv without asking if it's missing (scripts, CI)          |
 
 ### mpv tips
 
 - `#` cycles audio tracks (dub / Japanese on dual-audio files), `j` cycles subtitles. Dub mode starts with subtitles off. Many files have an English `Forced` track that only translates on-screen signs, which is handy with the dub.
-- Sub mode picks the full English subtitles by track name. Some files mark the episode-title card or a signs-only track as the default English subtitles, which mpv alone would show. reanime handles this with a small mpv script it keeps in your cache folder (`%LOCALAPPDATA%\reanime` on Windows, `~/Library/Caches/reanime` on macOS, `~/.cache/reanime` on Linux).
+- Sub mode picks the full English subtitles by track name. Some files mark the episode-title card or a signs-only track as the default English subtitles, which mpv alone would show. reanime handles this with a small mpv script it keeps in your cache folder, next to the one that skips openings and endings (`%LOCALAPPDATA%\reanime` on Windows, `~/Library/Caches/reanime` on macOS, `~/.cache/reanime` on Linux).
 - Episodes queue up one at a time, so `Enter` right after an episode starts may need a second press once the next one is in (a couple of seconds).
+- The opening and ending skip goes by chapter names ("Opening Song", "Intro", "Ending Song", "Credits", "Preview" and the like), so it only works on files that have chapters. Of the One Piece episodes checked, 1 and 1151 have them and 500 doesn't, so it just plays through. `PgDn` right after a skip goes back to the opening, and it won't be skipped again. The ending skip also skips anything after the credits, such as the next-episode preview; `<` goes back to the previous episode, which then plays in full. Quitting during an ending counts as watched.
 - Where you left off is kept in `%APPDATA%\reanime\history.json` on Windows (`~/Library/Application Support/reanime` on macOS, `~/.local/state/reanime` on Linux). Delete it to forget everything.
 - **mpv-android:** the app picks the audio and subtitle tracks itself. For dub-by-default, add `alang=eng` under Settings > Advanced > Edit mpv.conf. If a sub episode only shows the episode title, switch to the "Full Subtitles" track from the subtitle button.
 
@@ -111,7 +114,7 @@ Links are tied to your IP address and expire after 6 hours, so reanime never fet
 
 ## Development
 
-The tests run offline against fixtures shaped like the real site responses, so they need no network. Two of them also drive a real mpv (the subtitle picker and a whole binge session) when one is installed, and are skipped otherwise:
+The tests run offline against fixtures shaped like the real site responses, so they need no network. Three of them also drive a real mpv (the subtitle picker, a whole binge session, and the opening and ending skip) when one is installed, and are skipped otherwise:
 
 ```bash
 python -m unittest discover -s tests -v

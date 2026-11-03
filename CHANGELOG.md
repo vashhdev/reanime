@@ -15,6 +15,10 @@ All notable changes to this project are documented here. This project follows
   `reanime` offers to continue the last show where you stopped, `reanime "one piece"`
   opens the picker on it with your last audio choice, and mpv reopens at the volume
   you last used.
+- **Opening and ending skip.** When a file marks them as chapters (One Piece 1 and
+  1151 do, 500 doesn't), mpv jumps past the opening, and from the ending or the preview
+  straight to the next episode. `PgDn` brings a skipped opening back, quitting
+  during the ending counts as watched, and `--no-skip` turns it off.
 
 - **CI pipeline** (GitHub Actions): lint, offline tests on Windows/macOS/Linux with
   Python 3.8 and 3.13, package build, the real installers on fresh machines (plus
