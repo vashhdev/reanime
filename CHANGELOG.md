@@ -5,6 +5,8 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-02
+
 ### Added
 
 - **One mpv window for the whole binge.** reanime drives mpv over its JSON IPC and
@@ -19,7 +21,6 @@ All notable changes to this project are documented here. This project follows
   1151 do, 500 doesn't), mpv jumps past the opening, and from the ending or the preview
   straight to the next episode. `PgDn` brings a skipped opening back, quitting
   during the ending counts as watched, and `--no-skip` turns it off.
-
 - **CI pipeline** (GitHub Actions): lint, offline tests on Windows/macOS/Linux with
   Python 3.8 and 3.13, package build, the real installers on fresh machines (plus
   Termux in Docker), a daily live check against reanime.to, and tag-driven releases.
