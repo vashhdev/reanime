@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 SITE = "https://reanime.to"
 SEARCH_API = SITE + "/api/v1/search?limit=20&q={}"
@@ -1272,7 +1272,8 @@ def main():
     if playing and not (args.anime or args.episode or args.dub or args.sub):
         cont = continue_prompt()
         if cont:
-            watch(cmd, *cont)
+            anime, eps, lang, idx, start = cont
+            watch(cmd, anime, eps, idx, lang, start)
             return
 
     slug, url_ep, url_lang = parse_url(args.anime or "")
