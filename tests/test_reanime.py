@@ -795,7 +795,8 @@ class ChapterSkip(unittest.TestCase):
                                         "--really-quiet", f"--log-file={log}",
                                         *reanime.skip_args()],
                                        Session.anime, Session.eps, 0, "dub", stop=1)
-        said = re.findall(r"\[i\]\[skip_chapters\] (.*)", read(log))
+        # (some mpv versions end each log line with a space)
+        said = re.findall(r"\[i\]\[skip_chapters\] (.*?) *$", read(log), re.M)
         # 1: opening skipped, then the ending goes to 2. 2: opening skipped, and with
         # nothing queued after it, its ending plays
         self.assertEqual(said, ["skipped Opening Song", "ending: next episode", "skipped Intro"])
