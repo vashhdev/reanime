@@ -7,15 +7,20 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- **Your fixes stick to the show.** An audio delay, subtitle size or subtitle position
+  you change in mpv is saved per show, for dub and sub separately, and set again the
+  next time you watch it (Jujutsu Kaisen's dub needs +0.9s).
 - **`Tab` skips by hand** in mpv, one key with no `Fn`: past the chapter that's
-  playing (from the ending, to the next episode), or 85 seconds when the file has no
-  chapters.
+  playing and any ending or preview right after it (to the next episode if that's
+  all that's left), or 85 seconds when the file has no chapters.
 
 ### Fixed
 
 - The opening skip no longer skips the story before the opening in files that call
   it "Intro" (Jujutsu Kaisen): "Intro" counts as the opening only when no chapter
   is named like one.
+- The ending skip stops at an extra after the ending (Jujutsu Kaisen's "Juju
+  Stroll") instead of jumping straight to the next episode.
 - Rewinding to before a skipped opening skips it again. Jumping to an opening or
   ending yourself (`PgDn`, a seek) still plays it.
 

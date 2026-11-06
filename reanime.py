@@ -512,10 +512,12 @@ end)
 """
 
 # many files mark the opening and the ending as chapters, under all sorts of names.
-# this mpv script jumps past the opening, and from the ending (or the preview) straight
-# to the next episode. files without chapters just play through. Tab skips by hand.
+# this mpv script jumps past the opening, and past the ending and preview: to an extra
+# after the ending if there is one, else to the next episode. files without chapters
+# just play through. Tab skips by hand.
 CHAPTER_SKIPPER = """\
--- written by reanime: skip openings, and go from the ending to the next episode.
+-- written by reanime: skip openings, and endings and previews (to an extra after the
+-- ending if there is one, else to the next episode).
 -- Tab skips by hand: to the next chapter, or 85s (an opening) in files without them.
 -- titles seen on reanime's files: "Opening Song", "Intro", "To Be Continued & Ending
 -- Song", "Credits", "On The Next episode". whole words only, so "Introduction" stays.
@@ -570,6 +572,23 @@ local function next_episode()
     end
 end
 
+-- past chapter ch to the next one that isn't an opening, ending or preview (after an
+-- ending that keeps extras like Jujutsu Kaisen's "Juju Stroll"), else to the next
+-- episode once only endings and previews are left
+local function skip_from(path, ch, hint)
+    local list, kinds = mp.get_property_native("chapter-list") or {}, classify(path)
+    local skipped = list[ch + 1] and list[ch + 1].title or "to the next chapter"
+    for j = ch + 1, #list - 1 do
+        if not kinds[j] then
+            mp.osd_message("skipped " .. skipped .. hint, 3)
+            return mp.commandv("seek", list[j + 1].time, "absolute+exact")
+        end
+    end
+    for j = math.max(ch, 0), #list - 1 do
+        if kinds[j] == "ending" then return next_episode() end
+    end
+end
+
 local function check()
     local path, ch = mp.get_property("path"), mp.get_property_number("chapter")
     local key = path and ch and (path .. "#" .. ch)
@@ -586,31 +605,21 @@ local function check()
     local pos = mp.get_property_number("time-pos")
     local by_seek = seeking or mp.get_time() - settled < 0.5
     if not first and (by_seek or (pos and pos > c.time + 2)) then return end
-    if what == "ending" then return next_episode() end
-    local after = list[ch + 2]
-    if after then
-        mp.msg.info("skipped " .. c.title)
-        mp.osd_message("skipped " .. c.title .. "  (PgDn to watch it)", 3)
-        mp.commandv("seek", after.time, "absolute+exact")
-    end
+    mp.msg.info("skipped " .. c.title)
+    skip_from(path, ch, what == "opening" and "  (PgDn to watch it)" or "")
 end
 
--- by hand: past the chapter playing (an ending goes to the next episode), unless the
--- next chapter is far off or there are none: then an opening's worth
+-- by hand: past the chapter playing (and any opening, ending or preview right after
+-- it), unless the next chapter is far off or there are none: then an opening's worth
 mp.add_key_binding(KEY, "skip", function()
     local path, ch = mp.get_property("path"), mp.get_property_number("chapter", -1)
     local pos = mp.get_property_number("time-pos")
     if not (path and pos) then return end
     local list = mp.get_property_native("chapter-list") or {}
     local c, after = list[ch + 1], list[ch + 2]
-    if c and classify(path)[ch] == "ending" then
-        mp.msg.info("skip key: ending")
-        return next_episode()
-    end
-    if after and after.time - pos <= NEAR then
+    if classify(path)[ch] or (after and after.time - pos <= NEAR) then
         mp.msg.info("skip key: " .. (c and c.title or "start"))
-        mp.osd_message("skipped " .. (c and c.title or "to " .. after.title), 2)
-        mp.commandv("seek", after.time, "absolute+exact")
+        skip_from(path, ch, "")
     else
         mp.msg.info("skip key: " .. BY_HAND .. "s")
         mp.osd_message("skipped " .. BY_HAND .. "s", 2)
@@ -736,9 +745,19 @@ def load_history():
     return data if isinstance(data, dict) else {}
 
 
-def remember(anime, ep, lang, pos=None, volume=None):
-    """note where anime was left off: pos seconds into ep, or None once ep was watched.
-    history is a convenience, so a failed write never stops playback."""
+def show_tweaks(history, anime, lang):
+    """the TWEAKS saved for anime in lang: {mpv property: value}."""
+    saved = (history.get("tweaks") or {}).get(f"{anime.get('_slug')}/{lang}")
+    if not isinstance(saved, dict):
+        return {}
+    return {k: v for k, v in saved.items()
+            if k in TWEAKS and isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def remember(anime, ep, lang, pos=None, volume=None, tweaks=None):
+    """note where anime was left off: pos seconds into ep, or None once ep was watched,
+    and the TWEAKS changed for it in lang. history is a convenience, so a failed write
+    never stops playback."""
     data = load_history()
     slug = anime.get("_slug")
     if slug:
@@ -748,6 +767,10 @@ def remember(anime, ep, lang, pos=None, volume=None):
                        "position": None if pos is None else round(pos, 1),
                        "time": int(time.time())}
         data["shows"], data["last"] = shows, slug
+    if slug and tweaks:
+        everything = data.get("tweaks") if isinstance(data.get("tweaks"), dict) else {}
+        everything[f"{slug}/{lang}"] = {**show_tweaks(data, anime, lang), **tweaks}
+        data["tweaks"] = everything
     if isinstance(volume, (int, float)):
         data["volume"] = round(volume)
     path = os.path.join(state_dir(), "history.json")
@@ -788,6 +811,10 @@ def clock(sec):
 # and fullscreen carry over. links are fetched one episode ahead, so none is older
 # than about one episode when mpv opens it (they expire after six hours).
 
+# what you change in mpv for a show sticks to it, for dub and sub separately: audio
+# delay (Ctrl + and Ctrl -), subtitle size (F, G) and position (r, R). some releases
+# need their dub shifted, or have huge subtitles
+TWEAKS = ("audio-delay", "sub-scale", "sub-pos")
 POLL = 1.0       # seconds between looks at mpv's playlist position
 DONE_AT = 120    # quitting this close to the end, or once the ending starts (when the
                  # file marks it as a chapter), counts as watched
@@ -910,15 +937,22 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
 
     path = ipc_path()
     argv = [*cmd, *mpv_args(lang), f"--input-ipc-server={path}"]
-    volume = load_history().get("volume")
+    history = load_history()
+    volume = history.get("volume")
     if isinstance(volume, (int, float)):
         argv.append(f"--volume={volume:g}")
+    tweaks = show_tweaks(history, anime, lang)
+    if tweaks:
+        argv += [f"--{k}={v:g}" for k, v in tweaks.items()]
+        sys.stderr.write(f"your settings for {name} ({lang}): "
+                         + "  ".join(f"{k} {v:g}" for k, v in tweaks.items()) + "\n")
     first = [f"--force-media-title={title}"] + ([f"--start={start:.1f}"] if start else [])
     proc = subprocess.Popen([*argv, "--{", *first, url, "--}"])   # per-file options
 
     queue = [idx]                     # mpv playlist entry -> index into eps
     cur, pos, dur, vol, status = idx, (start or None), None, None, "done"
     ending = None                     # where the ending starts, from CHAPTER_SKIPPER
+    began, now = {}, {}               # TWEAKS as mpv opened, and as they are
     nxt, pending, misses = idx + 1, None, 0
     ipc = mpv_connect(path, proc)
     try:
@@ -927,6 +961,11 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
                 entry = ipc.get("playlist-pos")
                 t, d, v = ipc.get("time-pos"), ipc.get("duration"), ipc.get("volume")
                 e = ipc.get("user-data/reanime/ending")
+                for k in TWEAKS:
+                    x = ipc.get(k)
+                    if isinstance(x, (int, float)):
+                        began.setdefault(k, x)
+                        now[k] = x
             except (EOFError, OSError, ValueError):
                 break                           # mpv is shutting down
             if isinstance(entry, int) and 0 <= entry < len(queue):
@@ -978,7 +1017,8 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
     if ipc and status == "done" and pos is not None and not watched:
         status = "stopped"
     seconds = pos if status in ("stopped", "quit") else None
-    remember(anime, eps[cur], lang, seconds, vol)
+    changed = {k: round(x, 3) for k, x in now.items() if x != began[k]}
+    remember(anime, eps[cur], lang, seconds, vol, changed)
     return cur, seconds, status
 
 

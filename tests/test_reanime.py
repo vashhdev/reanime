@@ -471,14 +471,21 @@ class FakeMpv:
     the command line; every file lasts `length` polls of `duration` seconds, then the
     next one plays, or mpv exits after the last. `actions` maps a poll number to
     "next" (Enter in mpv) or "quit" (q). `ending` is where the chapter skipper says
-    every file's ending starts (None: no chapters, or no skipper)."""
+    every file's ending starts (None: no chapters, or no skipper). `changes` maps a poll
+    number to settings the viewer changes then ({"audio-delay": 0.9})."""
 
-    def __init__(self, argv, length=3, actions=None, duration=1400.0, volume=55.0, ending=None):
+    def __init__(self, argv, length=3, actions=None, duration=1400.0, volume=55.0, ending=None,
+                 changes=None):
         self.argv = argv
         self.playlist = [a for a in argv if a.startswith("https://")]
         self.titles = [a.split("=", 1)[1] for a in argv if a.startswith("--force-media-title=")]
         self.length, self.actions, self.duration, self.volume = length, actions or {}, duration, volume
-        self.ending = ending
+        self.ending, self.changes = ending, changes or {}
+        self.settings = {"audio-delay": 0.0, "sub-scale": 1.0, "sub-pos": 100}
+        for a in argv:                          # --audio-delay=0.9 and the like
+            k, _, v = a[2:].partition("=")
+            if a.startswith("--") and k in self.settings:
+                self.settings[k] = float(v)
         self.pos, self.tick, self.polls, self.exited, self.printed = 0, 0, 0, False, []
 
     # the process
@@ -497,6 +504,7 @@ class FakeMpv:
         if prop == "playlist-pos":
             self.polls += 1
             self.tick += 1
+            self.settings.update(self.changes.get(self.polls, {}))
             action = self.actions.get(self.polls)
             if action == "next" or self.tick > self.length:
                 if self.pos + 1 >= len(self.playlist):
@@ -508,7 +516,8 @@ class FakeMpv:
                 raise EOFError
             return self.pos
         return {"time-pos": self.duration * self.tick / self.length, "duration": self.duration,
-                "volume": self.volume, "user-data/reanime/ending": self.ending}[prop]
+                "volume": self.volume, "user-data/reanime/ending": self.ending,
+                **self.settings}[prop]
 
     def command(self, *args, **named):
         if named.get("name", args[0] if args else None) == "loadfile" or args[:1] == ("loadfile",):
@@ -526,7 +535,11 @@ class Session(unittest.TestCase):
     eps = [{"number": n, "title": f"T{n}"} for n in (1, 2, 3)]
     anime = dict(ANIME, _slug="one-piece-xamk74")
 
-    def run_session(self, idx=0, stop=None, start=0.0, resolve=fake_resolve, **fake):
+    def setUp(self):
+        with contextlib.suppress(FileNotFoundError):        # each test starts with none
+            os.remove(os.path.join(reanime.state_dir(), "history.json"))
+
+    def run_session(self, idx=0, stop=None, start=0.0, resolve=fake_resolve, lang="dub", **fake):
         mpvs = []
 
         def popen(argv):
@@ -537,7 +550,7 @@ class Session(unittest.TestCase):
                 mock.patch.object(reanime, "mpv_connect", lambda path, proc: proc), \
                 mock.patch.object(reanime, "POLL", 0.001), \
                 contextlib.redirect_stderr(io.StringIO()):
-            out = reanime.play_session(["mpv"], self.anime, self.eps, idx, "dub", start, stop)
+            out = reanime.play_session(["mpv"], self.anime, self.eps, idx, lang, start, stop)
         self.assertEqual(len(mpvs), 1)          # one window for the whole session
         return out, mpvs[0]
 
@@ -565,6 +578,23 @@ class Session(unittest.TestCase):
         (_, _, _), mpv = self.run_session(idx=1, start=466.7, actions={2: "quit"})
         self.assertIn("--volume=72", mpv.argv)
         self.assertIn("--start=466.7", mpv.argv)
+
+    def test_settings_changed_in_mpv_stick_to_the_show_and_language(self):
+        # dub: audio delay raised to +0.9s (Ctrl + nine times) during episode 1
+        self.run_session(actions={4: "quit"}, changes={2: {"audio-delay": 0.1 * 9}})
+        self.assertEqual(reanime.load_history()["tweaks"],
+                         {"one-piece-xamk74/dub": {"audio-delay": 0.9}})
+        # the next dub session opens with it, and changing the subtitles adds to it
+        _, mpv = self.run_session(actions={3: "quit"}, changes={2: {"sub-scale": 0.5}})
+        self.assertIn("--audio-delay=0.9", mpv.argv)
+        self.assertEqual(reanime.load_history()["tweaks"],
+                         {"one-piece-xamk74/dub": {"audio-delay": 0.9, "sub-scale": 0.5}})
+        # sub keeps its own: no audio delay
+        _, mpv = self.run_session(actions={2: "quit"}, lang="sub")
+        self.assertFalse([a for a in mpv.argv if a.startswith(("--audio-delay", "--sub-scale"))])
+        # setting it back to 0 is a change too
+        self.run_session(actions={3: "quit"}, changes={2: {"audio-delay": 0.0}})
+        self.assertEqual(reanime.load_history()["tweaks"]["one-piece-xamk74/dub"]["audio-delay"], 0)
 
     def test_quitting_during_the_ending_counts_as_watched(self):
         # quit 2/3 into episode 1 (933s of 1400): past an ending marked at 900s...
@@ -671,15 +701,21 @@ class Session(unittest.TestCase):
         cmd = [forced] if forced else reanime.find_mpv("mpv")
         if not cmd:
             self.skipTest("mpv not installed")
-        sent = []
+        sent, settings = [], {}
         real_command = reanime.MpvIpc.command
 
         def spy(ipc, *args, **named):
             sent.append(named.get("name") or args[0])
-            return real_command(ipc, *args, **named)
+            got = real_command(ipc, *args, **named)
+            if args[:1] == ("get_property",) and args[1] in reanime.TWEAKS:
+                settings[args[1]] = got
+            return got
 
         def lavfi(anime, ep, lang, verbose=True):
             return f"av://lavfi:testsrc=duration=2:size=64x64:rate={10 + ep['number']}", {}
+        # settings saved for this show: mpv has to accept them as options
+        reanime.remember(self.anime, self.eps[0], "dub",
+                         tweaks={"audio-delay": 0.9, "sub-scale": 0.5, "sub-pos": 102})
         with mock.patch.object(reanime, "resolve", lavfi), \
                 mock.patch.object(reanime.MpvIpc, "command", spy), \
                 mock.patch.object(reanime, "POLL", 0.1), \
@@ -688,6 +724,7 @@ class Session(unittest.TestCase):
                                         "--really-quiet"], self.anime, self.eps, 0, "dub")
         self.assertEqual(got, (2, None, "done"))
         self.assertEqual(sent.count("loadfile"), 2)                    # 2 and 3 appended
+        self.assertEqual(settings, {"audio-delay": 0.9, "sub-scale": 0.5, "sub-pos": 102})
 
 
 # ------------------------------------------------------------------ player setup
@@ -788,11 +825,12 @@ class ChapterSkip(unittest.TestCase):
 
     def edl(self, *parts):
         """an episode of (chapter title, seconds) parts. mpv drops an edl's last segment
-        from this fixture, so a short tail goes after them."""
+        from this fixture, so a short tail goes after them, named like a preview so
+        the skipper never stops there."""
         fixture = os.path.join(ROOT, "tests", "fixtures", "partial-subs.mkv")
         source = f"%{len(fixture.encode())}%{fixture}"
         return "edl://" + ";".join(f"{source},start=0,length={n},title={t}"
-                                   for t, n in parts + (("Tail", 0.5),))
+                                   for t, n in parts + (("Preview", 0.5),))
 
     def said(self, log, script="skip_chapters"):
         # (some mpv versions end each log line with a space)
@@ -804,8 +842,10 @@ class ChapterSkip(unittest.TestCase):
                    2: ("Scene 1", "Intro", "Scene 3", "Credits", "Scene 5")}
 
         def edl(anime, ep, lang, verbose=True):
-            # 1s story, 1.5s opening, 0.5s story, 1.5s ending, 1.5s preview
-            return self.edl(*zip(layouts[ep["number"]], (1, 1.5, 0.5, 1.5, 1.5))), {}
+            # 1s story, 1.5s opening, 1.5s story, 1.5s ending, 1.5s preview. the story
+            # parts outlast the moment after a seek or a file start, when the skipper
+            # takes a chapter change for a jump
+            return self.edl(*zip(layouts[ep["number"]], (1, 1.5, 1.5, 1.5, 1.5))), {}
 
         ending = []
         real_get = reanime.MpvIpc.get
@@ -822,15 +862,19 @@ class ChapterSkip(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             got = reanime.play_session([*self.mpv(), f"--log-file={log}", *reanime.skip_args()],
                                        Session.anime, Session.eps, 0, "dub", stop=1)
-        # 1: opening skipped, then the ending goes to 2. 2: its "Intro" is the opening
-        # (no chapter is named one), and with nothing queued after it, its ending plays
-        self.assertEqual(self.said(log), ["skipped Opening Song", "ending: next episode",
-                                          "skipped Intro"])
+        # 1: opening skipped, and after the ending only a preview: on to 2. 2: its
+        # "Intro" is the opening (no chapter is named one), and its "Credits" skip to
+        # "Scene 5", the chapter after them that isn't an ending or a preview
+        said = self.said(log)
+        self.assertEqual(said[:5], ["skipped Opening Song", "skipped To Be Continued & Ending Song",
+                                    "ending: next episode", "skipped Intro", "skipped Credits"])
+        self.assertLessEqual(set(said[5:]), {"skipped Preview"})     # if mpv plays the tail
         self.assertEqual(got, (1, None, "done"))
-        self.assertIn(3.0, ending)          # where the ending starts, read over the IPC
+        self.assertIn(4.0, ending)          # where the ending starts, read over the IPC
 
     def test_real_mpv_rewind_pgdn_and_the_skip_key(self):
-        # episode 1 calls its story before the opening "Intro" (like Jujutsu Kaisen), and
+        # episode 1 is laid out like Jujutsu Kaisen: the story before the opening is
+        # "Intro", and "Juju Stroll" (an extra) sits between the ending and the preview.
         # a driver script does what a viewer would: rewind to the start once the opening
         # is skipped, then PgDn back to the opening, then Tab. episode 2 has no chapters,
         # and gets Tab once
@@ -868,12 +912,15 @@ end)
         log = os.path.join(CACHE.name, "keys.log")
         subprocess.run([*self.mpv(), f"--log-file={log}", *reanime.skip_args(),
                         f"--script={driver}",
-                        self.edl(("Intro", 1), ("Opening", 2), ("Part A", 3), ("Ending", 1.5)),
+                        self.edl(("Intro", 1), ("Opening", 2), ("Part A", 3), ("Ending", 1.5),
+                                 ("Juju Stroll", 1), ("Preview", 1)),
                         long], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         self.assertEqual(self.said(log), [
             "skipped Opening",          # "Intro" played: this file names its opening
             "skipped Opening",          # rewound before it: skipped again
             "skip key: Opening",        # PgDn brought it back, Tab skipped it
+            "skipped Ending",           # to the extra after it, which plays
+            "skipped Preview",
             "ending: next episode",
             "skip key: 85s",            # no chapters: an opening's worth
         ])
