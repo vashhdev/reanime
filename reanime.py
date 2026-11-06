@@ -513,32 +513,52 @@ end)
 
 # many files mark the opening and the ending as chapters, under all sorts of names.
 # this mpv script jumps past the opening, and from the ending (or the preview) straight
-# to the next episode. files without chapters just play through.
+# to the next episode. files without chapters just play through. Tab skips by hand.
 CHAPTER_SKIPPER = """\
--- written by reanime: skip openings, and go from the ending to the next episode
+-- written by reanime: skip openings, and go from the ending to the next episode.
+-- Tab skips by hand: to the next chapter, or 85s (an opening) in files without them.
 -- titles seen on reanime's files: "Opening Song", "Intro", "To Be Continued & Ending
 -- Song", "Credits", "On The Next episode". whole words only, so "Introduction" stays.
--- openings are matched first, so "Opening Credits" is an opening
-local OPENING = {"opening", "intro", "op%d*"}
+-- "Intro" is an opening only in files that name no chapter "Opening" or "OP": some
+-- (Jujutsu Kaisen) call the story before the opening "Intro". openings are matched
+-- before endings, so "Opening Credits" is an opening
+local OPENING = {"opening", "op%d*"}
+local INTRO = {"intro"}
 local ENDING = {"ending", "credits", "outro", "ed%d*", "preview", "next episode", "next time"}
+local KEY, BY_HAND, NEAR = "TAB", 85, 150
 
 local function matches(title, words)
-    title = title:lower()
+    title = (title or ""):lower()
     for _, w in ipairs(words) do
         if title:find("%f[%w]" .. w .. "%f[%W]") then return true end
     end
     return false
 end
 
-local function kind(c)
-    local title = c and c.title or ""
-    if matches(title, OPENING) then return "opening" end
-    if matches(title, ENDING) then return "ending" end
+local kinds, kinds_of = {}, nil     -- chapter number -> "opening" / "ending", for a file
+
+local function classify(path)
+    if kinds_of == path then return kinds end
+    local list, named = mp.get_property_native("chapter-list") or {}, false
+    kinds, kinds_of = {}, path
+    for i, c in ipairs(list) do
+        if matches(c.title, OPENING) then
+            kinds[i - 1], named = "opening", true
+        elseif matches(c.title, ENDING) then
+            kinds[i - 1] = "ending"
+        end
+    end
+    for i, c in ipairs(list) do
+        if not named and not kinds[i - 1] and matches(c.title, INTRO) then
+            kinds[i - 1] = "opening"
+        end
+    end
+    return kinds
 end
 
-local skipped = {}      -- "path#chapter" skipped once already: seeking back plays it
 local at, opened        -- the chapter playing now, and the file it started in
 local waiting = false   -- reached an ending before the next episode was queued
+local seeking, settled = false, 0
 
 local function next_episode()
     local pos = mp.get_property_number("playlist-pos", 0)
@@ -557,15 +577,15 @@ local function check()
     at, waiting = key, false
     if not key then return end
     local list = mp.get_property_native("chapter-list") or {}
-    local c, first = list[ch + 1], opened ~= path
+    local c, what, first = list[ch + 1], classify(path)[ch], opened ~= path
     opened = path
-    local what = kind(c)
-    if not what or skipped[key] then return end
-    -- skip a chapter playback runs into, or one a file opens in (a resume), but not
-    -- one the viewer seeks into the middle of
+    if not (c and what) then return end
+    -- skip a chapter playback runs into, or the one a file opens in (a resume). never
+    -- one the viewer seeks or jumps to (PgDn back to an opening plays it), but rewind
+    -- to before it and it is skipped again
     local pos = mp.get_property_number("time-pos")
-    if not first and pos and pos > c.time + 2 then return end
-    skipped[key] = true
+    local by_seek = seeking or mp.get_time() - settled < 0.5
+    if not first and (by_seek or (pos and pos > c.time + 2)) then return end
     if what == "ending" then return next_episode() end
     local after = list[ch + 2]
     if after then
@@ -575,11 +595,36 @@ local function check()
     end
 end
 
+-- by hand: past the chapter playing (an ending goes to the next episode), unless the
+-- next chapter is far off or there are none: then an opening's worth
+mp.add_key_binding(KEY, "skip", function()
+    local path, ch = mp.get_property("path"), mp.get_property_number("chapter", -1)
+    local pos = mp.get_property_number("time-pos")
+    if not (path and pos) then return end
+    local list = mp.get_property_native("chapter-list") or {}
+    local c, after = list[ch + 1], list[ch + 2]
+    if c and classify(path)[ch] == "ending" then
+        mp.msg.info("skip key: ending")
+        return next_episode()
+    end
+    if after and after.time - pos <= NEAR then
+        mp.msg.info("skip key: " .. (c and c.title or "start"))
+        mp.osd_message("skipped " .. (c and c.title or "to " .. after.title), 2)
+        mp.commandv("seek", after.time, "absolute+exact")
+    else
+        mp.msg.info("skip key: " .. BY_HAND .. "s")
+        mp.osd_message("skipped " .. BY_HAND .. "s", 2)
+        mp.commandv("seek", BY_HAND, "relative+exact")
+    end
+end)
+
+mp.register_event("seek", function() seeking = true end)
+mp.register_event("playback-restart", function() seeking, settled = false, mp.get_time() end)
 -- where the ending starts, for reanime to count quitting during it as watched
 mp.register_event("file-loaded", function()
-    local start = 0
-    for _, c in ipairs(mp.get_property_native("chapter-list") or {}) do
-        if kind(c) == "ending" then start = c.time break end
+    local path, start = mp.get_property("path"), 0
+    for i, c in ipairs(mp.get_property_native("chapter-list") or {}) do
+        if classify(path)[i - 1] == "ending" then start = c.time break end
     end
     mp.set_property_native("user-data/reanime/ending", start)
     check()

@@ -5,6 +5,20 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added
+
+- **`Tab` skips by hand** in mpv, one key with no `Fn`: past the chapter that's
+  playing (from the ending, to the next episode), or 85 seconds when the file has no
+  chapters.
+
+### Fixed
+
+- The opening skip no longer skips the story before the opening in files that call
+  it "Intro" (Jujutsu Kaisen): "Intro" counts as the opening only when no chapter
+  is named like one.
+- Rewinding to before a skipped opening skips it again. Jumping to an opening or
+  ending yourself (`PgDn`, a seek) still plays it.
+
 ## [1.1.1] - 2026-11-03
 
 ### Fixed

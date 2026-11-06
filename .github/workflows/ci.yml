@@ -122,7 +122,8 @@ jobs:
           REANIME_TEST_MPV="$mpv" python3 -m unittest -v \
             tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track \
             tests.test_reanime.Session.test_real_mpv_plays_a_whole_session_in_one_window \
-            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending
+            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending \
+            tests.test_reanime.ChapterSkip.test_real_mpv_rewind_pgdn_and_the_skip_key
       - name: reanime runs, mpv found and plays
         if: runner.os == 'Windows'
         shell: pwsh
@@ -140,7 +141,8 @@ jobs:
           python -m unittest -v `
             tests.test_reanime.SubPicker.test_real_mpv_skips_the_title_card_track `
             tests.test_reanime.Session.test_real_mpv_plays_a_whole_session_in_one_window `
-            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending
+            tests.test_reanime.ChapterSkip.test_real_mpv_skips_the_opening_and_the_ending `
+            tests.test_reanime.ChapterSkip.test_real_mpv_rewind_pgdn_and_the_skip_key
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   ok:

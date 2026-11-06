@@ -753,8 +753,9 @@ class ChapterSkip(unittest.TestCase):
     """the mpv script that skips openings and goes from the ending to the next episode."""
 
     def kind(self, title):
-        """CHAPTER_SKIPPER's matching, in Python: whole words, %d* = digits, opening first."""
-        for kind, table in (("opening", "OPENING"), ("ending", "ENDING")):
+        """CHAPTER_SKIPPER's matching, in Python: whole words, %d* = digits. "intro" is
+        an opening only in files with no chapter named like one."""
+        for kind, table in (("opening", "OPENING"), ("ending", "ENDING"), ("intro", "INTRO")):
             words = re.findall(r'"([^"]+)"', re.search(rf"local {table} = \{{(.*)\}}",
                                                        reanime.CHAPTER_SKIPPER)[1])
             if any(re.search(r"(?<![a-z0-9])" + w.replace("%d*", "[0-9]*") + r"(?![a-z0-9])",
@@ -765,7 +766,8 @@ class ChapterSkip(unittest.TestCase):
     def test_chapter_titles(self):
         # chapter titles from reanime's One Piece files (episodes 1 and 1151), and others
         for kind, titles in {
-            "opening": ["Opening Song", "Intro", "OP", "OP2", "Opening Credits"],
+            "opening": ["Opening Song", "OP", "OP2", "Opening Credits"],
+            "intro": ["Intro"],
             "ending": ["To Be Continued & Ending Song", "Credits", "On The Next episode",
                        "ED", "End Credits", "Preview", "Next Time"],
             None: ["Gol D Roger Speech", "Part A", "Episode Name", "Eyecatch", "Part C",
@@ -774,25 +776,36 @@ class ChapterSkip(unittest.TestCase):
             for title in titles:
                 self.assertEqual(self.kind(title), kind, title)
 
-    def test_real_mpv_skips_the_opening_and_the_ending(self):
-        # two "episodes" built from the fixture with mpv's edl://, one segment (and so
-        # one chapter) per part. REANIME_TEST_MPV makes this mandatory (CI's install stage)
+    # real mpv. episodes are built from the fixture with mpv's edl://, one segment (and
+    # so one chapter) per part. REANIME_TEST_MPV makes these mandatory (CI's install stage)
+
+    def mpv(self):
         forced = os.environ.get("REANIME_TEST_MPV")
         cmd = [forced] if forced else reanime.find_mpv("mpv")
         if not cmd:
             self.skipTest("mpv not installed")
+        return [*cmd, "--no-config", "--vo=null", "--ao=null", "--really-quiet"]
+
+    def edl(self, *parts):
+        """an episode of (chapter title, seconds) parts. mpv drops an edl's last segment
+        from this fixture, so a short tail goes after them."""
         fixture = os.path.join(ROOT, "tests", "fixtures", "partial-subs.mkv")
         source = f"%{len(fixture.encode())}%{fixture}"
+        return "edl://" + ";".join(f"{source},start=0,length={n},title={t}"
+                                   for t, n in parts + (("Tail", 0.5),))
+
+    def said(self, log, script="skip_chapters"):
+        # (some mpv versions end each log line with a space)
+        return re.findall(rf"\[i\]\[{script}\] (.*?) *$", read(log), re.M)
+
+    def test_real_mpv_skips_the_opening_and_the_ending(self):
         layouts = {1: ("Gol D Roger Speech", "Opening Song", "Part A",
                        "To Be Continued & Ending Song", "On The Next episode"),
                    2: ("Scene 1", "Intro", "Scene 3", "Credits", "Scene 5")}
 
         def edl(anime, ep, lang, verbose=True):
-            # 0.5s story, 1.5s opening, 0.5s story, 1.5s ending, 1.5s preview, and a tail:
-            # mpv drops an edl's last segment from this fixture
-            parts = zip(layouts[ep["number"]] + ("Tail",), (0.5, 1.5, 0.5, 1.5, 1.5, 0.5))
-            return "edl://" + ";".join(f"{source},start=0,length={n},title={t}"
-                                       for t, n in parts), {}
+            # 1s story, 1.5s opening, 0.5s story, 1.5s ending, 1.5s preview
+            return self.edl(*zip(layouts[ep["number"]], (1, 1.5, 0.5, 1.5, 1.5))), {}
 
         ending = []
         real_get = reanime.MpvIpc.get
@@ -807,17 +820,65 @@ class ChapterSkip(unittest.TestCase):
                 mock.patch.object(reanime.MpvIpc, "get", spy), \
                 mock.patch.object(reanime, "POLL", 0.1), \
                 contextlib.redirect_stderr(io.StringIO()):
-            got = reanime.play_session([*cmd, "--no-config", "--vo=null", "--ao=null",
-                                        "--really-quiet", f"--log-file={log}",
-                                        *reanime.skip_args()],
+            got = reanime.play_session([*self.mpv(), f"--log-file={log}", *reanime.skip_args()],
                                        Session.anime, Session.eps, 0, "dub", stop=1)
-        # (some mpv versions end each log line with a space)
-        said = re.findall(r"\[i\]\[skip_chapters\] (.*?) *$", read(log), re.M)
-        # 1: opening skipped, then the ending goes to 2. 2: opening skipped, and with
-        # nothing queued after it, its ending plays
-        self.assertEqual(said, ["skipped Opening Song", "ending: next episode", "skipped Intro"])
+        # 1: opening skipped, then the ending goes to 2. 2: its "Intro" is the opening
+        # (no chapter is named one), and with nothing queued after it, its ending plays
+        self.assertEqual(self.said(log), ["skipped Opening Song", "ending: next episode",
+                                          "skipped Intro"])
         self.assertEqual(got, (1, None, "done"))
-        self.assertIn(2.5, ending)          # where the ending starts, read over the IPC
+        self.assertIn(3.0, ending)          # where the ending starts, read over the IPC
+
+    def test_real_mpv_rewind_pgdn_and_the_skip_key(self):
+        # episode 1 calls its story before the opening "Intro" (like Jujutsu Kaisen), and
+        # a driver script does what a viewer would: rewind to the start once the opening
+        # is skipped, then PgDn back to the opening, then Tab. episode 2 has no chapters,
+        # and gets Tab once
+        driver = os.path.join(CACHE.name, "driver.lua")
+        with open(driver, "w", encoding="utf-8") as fh:
+            fh.write("""
+local parts, pressed = 0, false
+mp.add_timeout(20, function() mp.command("quit") end)        -- the skipper broke
+mp.observe_property("chapter", "number", function(_, ch)
+    local c = ch and (mp.get_property_native("chapter-list") or {})[ch + 1]
+    if not c then return end
+    if c.title == "Part A" then
+        parts = parts + 1
+        if parts == 1 then mp.commandv("seek", "0", "absolute") end     -- rewind
+        if parts == 2 then mp.commandv("add", "chapter", "-1") end      -- PgDn
+    elseif c.title == "Opening" and parts == 2 then
+        mp.add_timeout(0.5, function() mp.commandv("script-binding", "skip_chapters/skip") end)
+    end
+end)
+mp.register_event("file-loaded", function()
+    if mp.get_property_number("chapter-list/count", 0) > 0 then return end
+    mp.add_timeout(0.5, function()
+        pressed = true
+        mp.commandv("script-binding", "skip_chapters/skip")
+    end)
+end)
+mp.register_event("playback-restart", function()
+    if not pressed then return end
+    mp.msg.info(string.format("at %.1f", mp.get_property_number("time-pos", -1)))
+    mp.command("quit")
+end)
+""")
+        fixture = os.path.join(ROOT, "tests", "fixtures", "partial-subs.mkv")
+        long = "edl://!no_chapters" + f";%{len(fixture.encode())}%{fixture}" * 60     # 120s
+        log = os.path.join(CACHE.name, "keys.log")
+        subprocess.run([*self.mpv(), f"--log-file={log}", *reanime.skip_args(),
+                        f"--script={driver}",
+                        self.edl(("Intro", 1), ("Opening", 2), ("Part A", 3), ("Ending", 1.5)),
+                        long], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(self.said(log), [
+            "skipped Opening",          # "Intro" played: this file names its opening
+            "skipped Opening",          # rewound before it: skipped again
+            "skip key: Opening",        # PgDn brought it back, Tab skipped it
+            "ending: next episode",
+            "skip key: 85s",            # no chapters: an opening's worth
+        ])
+        at = float(self.said(log, "driver")[0].split()[1])
+        self.assertTrue(85 <= at < 88, at)
 
 
 class Setup(unittest.TestCase):
