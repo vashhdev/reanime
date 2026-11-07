@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 SITE = "https://reanime.to"
 SEARCH_API = SITE + "/api/v1/search?limit=20&q={}"
