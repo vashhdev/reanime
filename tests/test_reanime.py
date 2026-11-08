@@ -419,6 +419,50 @@ class Picker(unittest.TestCase):
         self.assertIsNone(self.pick([("key", "esc")])[0])
 
 
+@unittest.skipUnless(hasattr(os, "openpty") and reanime.termios, "needs a POSIX terminal")
+class Keys(unittest.TestCase):
+    """keys typed into a real pseudo-terminal, sent the way Linux and macOS terminals send them."""
+
+    def setUp(self):
+        self.master, slave = os.openpty()
+        self.addCleanup(os.close, self.master)
+        self.addCleanup(os.close, slave)
+        reanime.tty.setcbreak(slave)            # keys written below are readable at once
+        # what a terminal looks like to Python: a text wrapper over a buffered reader
+        tty_in = io.TextIOWrapper(io.BufferedReader(io.FileIO(slave, "rb", closefd=False)),
+                                  encoding="utf-8")
+        for patch in (mock.patch.object(sys, "stdin", tty_in),
+                      mock.patch.object(reanime, "_held", bytearray())):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_escape_sequences_arrive_whole(self):
+        cases = [
+            (b"\x1b[A", [("key", "up")]),
+            (b"\x1b[B", [("key", "down")]),
+            (b"\x1bOA", [("key", "up")]),               # application cursor mode
+            (b"\x1b[1;5B", [("key", "down")]),          # Ctrl+Down
+            (b"\x1b[3~", [("key", "")]),                # Delete: ignored, not typed as "~"
+            (b"\x1b", [("key", "esc")]),
+            (b"\x1b[Ax", [("key", "up"), ("char", "x")]),
+            (b"ab", [("char", "a"), ("char", "b")]),
+            ("é".encode(), [("char", "é")]),
+            (b"\r", [("key", "enter")]),
+            (b"\x7f", [("key", "backspace")]),
+        ]
+        for typed, want in cases:
+            with self.subTest(typed=typed):
+                os.write(self.master, typed)
+                self.assertEqual([reanime._getkey() for _ in want], want)
+
+    def test_arrows_move_the_picker_instead_of_closing_it(self):
+        os.write(self.master, b"\x1b[B\x1b[B\x1b[A\r")
+        with mock.patch.object(reanime, "interactive_ok", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            picked = reanime.fuzzy_pick(["one", "two", "three"], str, "\npick:")
+        self.assertEqual(picked, "two")
+
+
 # ------------------------------------------------------------------ playback
 
 def fake_resolve(anime, ep, lang, verbose=True):
