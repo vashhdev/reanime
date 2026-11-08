@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **AniList tracking.** Log in once with `reanime --anilist`, and every episode you
+  finish sets your progress on AniList. reanime.to already names each show's AniList
+  entry, so nothing is matched by title. Progress only moves forward: rewatches and
+  completed shows are left alone, and the last episode marks a show completed. On
+  Android, choosing "next" counts the episode before it. `--anilist logout` stops it.
+
+### Changed
+
+- CI jobs time out (15 minutes for tests, 30 for installs) instead of hanging for six
+  hours when mpv or a test gets stuck.
+
 ## [1.2.1] - 2026-11-08
 
 ### Fixed

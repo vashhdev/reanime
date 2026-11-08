@@ -508,6 +508,12 @@ class Playback(unittest.TestCase):
         self.assertEqual(opts[default][1], "quit")
         self.assertNotIn("next", [v for _, v in opts])
 
+    def test_loop_counts_an_episode_watched_on_moving_to_the_next(self):
+        fake = FakeAniList()
+        with anilist(fake):
+            self.run_loop(0, ["next", "replay", "quit"])        # mpv-android reports nothing
+        self.assertEqual(fake.saved, [(21, 1, "CURRENT")])
+
 
 
 class FakeMpv:
@@ -574,14 +580,60 @@ class FakeMpv:
         pass
 
 
+class FakeAniList:
+    """AniList's GraphQL API for one viewer. `entry` is their {status, progress} for the
+    show (None: not on their list), `episodes` its length (None: still airing), and
+    `token` the only one it accepts."""
+
+    def __init__(self, episodes=None, entry=None, token="tok"):
+        self.episodes, self.entry, self.token, self.saved = episodes, entry, token, []
+        self.requests = 0
+
+    def __call__(self, req, timeout=None):
+        assert req.full_url == reanime.ANILIST_API, req.full_url
+        self.requests += 1
+        if req.get_header("Authorization") != f"Bearer {self.token}":
+            body = json.dumps({"errors": [{"message": "Invalid token", "status": 400}]})
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {},
+                                         io.BytesIO(body.encode()))
+        q = json.loads(req.data.decode())
+        v = q["variables"]
+        if "Viewer" in q["query"]:
+            data = {"Viewer": {"name": "vash"}}
+        elif "SaveMediaListEntry" in q["query"]:
+            self.saved.append((v["id"], v["progress"], v["status"]))
+            self.entry = {"status": v["status"], "progress": v["progress"]}
+            data = {"SaveMediaListEntry": {"progress": v["progress"]}}
+        else:
+            data = {"Media": {"episodes": self.episodes, "mediaListEntry": self.entry}}
+        return io.BytesIO(json.dumps({"data": data}).encode())
+
+
+@contextlib.contextmanager
+def anilist(fake, token="tok"):
+    """talk to the fake AniList, logged in with `token` (None: logged out)."""
+    path = os.path.join(reanime.state_dir(), "anilist.json")
+    if token:
+        os.makedirs(reanime.state_dir(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"token": token}, fh)
+    try:
+        with mock.patch.object(reanime.urllib.request, "urlopen", fake):
+            yield fake
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+
+
 class Session(unittest.TestCase):
     """the desktop binge: one mpv window, next episode appended while one plays."""
     eps = [{"number": n, "title": f"T{n}"} for n in (1, 2, 3)]
     anime = dict(ANIME, _slug="one-piece-xamk74")
 
     def setUp(self):
-        with contextlib.suppress(FileNotFoundError):        # each test starts with none
-            os.remove(os.path.join(reanime.state_dir(), "history.json"))
+        for name in ("history.json", "anilist.json"):        # each test starts with none
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(reanime.state_dir(), name))
 
     def run_session(self, idx=0, stop=None, start=0.0, resolve=fake_resolve, lang="dub", **fake):
         mpvs = []
@@ -648,6 +700,23 @@ class Session(unittest.TestCase):
         # ...but not before it
         (idx, pos, status), _ = self.run_session(actions={3: "quit"}, ending=1000.0)
         self.assertEqual((idx, status), (0, "stopped"))
+
+    def test_episodes_played_to_the_end_move_anilist_progress(self):
+        fake = FakeAniList()
+        with anilist(fake):
+            self.run_session()                                  # 1, 2 and 3 play through
+        self.assertEqual(fake.entry, {"status": "CURRENT", "progress": 3})
+        done = [p for _, p, _ in fake.saved]
+        self.assertEqual(done, sorted(done))                    # never went down
+        # > past episode 1, then quit a third into episode 2: neither was watched
+        fake = FakeAniList()
+        with anilist(fake):
+            self.run_session(actions={2: "next", 4: "quit"})
+        self.assertEqual(fake.saved, [])
+        # logged out: AniList is never contacted
+        with anilist(FakeAniList(), token=None) as fake:
+            self.run_session()
+        self.assertEqual(fake.requests, 0)
 
     def test_enter_skips_ahead_and_range_stops_at_its_end(self):
         (idx, _, status), mpv = self.run_session(stop=1, actions={3: "next"})
@@ -772,6 +841,75 @@ class Session(unittest.TestCase):
         self.assertEqual(got, (2, None, "done"))
         self.assertEqual(sent.count("loadfile"), 2)                    # 2 and 3 appended
         self.assertEqual(settings, {"audio-delay": 0.9, "sub-scale": 0.5, "sub-pos": 102})
+
+
+class AniList(unittest.TestCase):
+    """opt-in progress tracking: --anilist logs in, finished episodes move progress up."""
+    anime = dict(ANIME, _slug="one-piece-xamk74")
+
+    def progress(self, fake, number, token="tok"):
+        """track episode `number` -> what it reports, or None if it did nothing."""
+        with anilist(fake, token):
+            job = reanime.track(self.anime, {"number": number})
+            if job is None:
+                return None
+            job[0].join(10)
+        if "err" in job[1]:
+            raise job[1]["err"]
+        return job[1]["ok"]
+
+    def test_progress_only_moves_up(self):
+        fake = FakeAniList()                                    # One Piece: still airing
+        self.assertEqual(self.progress(fake, 1150), "ONE PIECE 1150")   # added to the list
+        self.assertEqual(fake.saved, [(21, 1150, "CURRENT")])
+        self.assertIsNone(self.progress(fake, 1150))            # already there
+        self.assertIsNone(self.progress(fake, 1100))            # rewatching an older one
+        self.assertIsNone(self.progress(fake, 1150.5))          # a recap isn't progress
+        self.assertEqual(self.progress(fake, 1153), "ONE PIECE 1153")   # skipping ahead counts
+        self.assertEqual(len(fake.saved), 2)
+
+    def test_last_episode_completes_and_completed_shows_are_left_alone(self):
+        fake = FakeAniList(episodes=24, entry={"status": "CURRENT", "progress": 23})
+        self.assertEqual(self.progress(fake, 24), "ONE PIECE 24  (completed)")
+        self.assertEqual(fake.saved[-1], (21, 24, "COMPLETED"))
+        self.assertIsNone(self.progress(fake, 3))               # a rewatch doesn't touch it
+        fake.entry = {"status": "REPEATING", "progress": 2}     # unless marked as rewatching
+        self.progress(fake, 3)
+        self.assertEqual(fake.saved[-1], (21, 3, "REPEATING"))
+        fake.entry = {"status": "PAUSED", "progress": 2}        # picking a show back up
+        self.progress(fake, 3)
+        self.assertEqual(fake.saved[-1], (21, 3, "CURRENT"))
+
+    def test_logged_out_or_no_anilist_id_sends_nothing(self):
+        fake = FakeAniList()
+        self.assertIsNone(self.progress(fake, 1150, token=None))
+        with anilist(fake):
+            self.assertIsNone(reanime.track(dict(self.anime, anilist_id=None), {"number": 1}))
+        self.assertEqual(fake.saved, [])
+
+    def test_expired_token_says_to_log_in_again(self):
+        with self.assertRaisesRegex(RuntimeError, r"run reanime --anilist again"):
+            self.progress(FakeAniList(token="new"), 1150, token="old")
+
+    def test_login_and_logout(self):
+        with anilist(FakeAniList(), token=None), \
+                mock.patch.object(reanime, "ANILIST_CLIENT", "123"), \
+                mock.patch("webbrowser.open") as browser:
+            with mock.patch("getpass.getpass", return_value="wrong"):
+                code, _, _ = run_main("--anilist")
+            self.assertIn("didn't take that token", code)
+            self.assertIsNone(reanime.anilist_token())
+            with mock.patch("getpass.getpass", return_value=" tok\n"):
+                code, out, _ = run_main("--anilist")
+            self.assertEqual(code, 0)
+            self.assertIn("logged in to AniList as vash", out)
+            self.assertIn("client_id=123&response_type=token", browser.call_args[0][0])
+            self.assertEqual(reanime.anilist_token(), "tok")
+            code, out, _ = run_main("--anilist", "logout")
+            self.assertIn("logged out of AniList", out)
+            self.assertIsNone(reanime.anilist_token())
+        with mock.patch.object(reanime, "ANILIST_CLIENT", ""):
+            self.assertIn("isn't set up", run_main("--anilist")[0])
 
 
 # ------------------------------------------------------------------ player setup

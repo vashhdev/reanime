@@ -831,6 +831,145 @@ def clock(sec):
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+# ------------------------------------------------------------------ AniList
+# opt-in progress tracking. `reanime --anilist` logs in once; from then on every
+# episode you finish moves your AniList progress up to it. reanime.to already names
+# each show's AniList entry, so there is no title matching. progress only goes up: an
+# episode at or below it, or anything you completed (a rewatch), is left alone.
+ANILIST_API = "https://graphql.anilist.co"
+# reanime's AniList API client (anilist.co/settings/developer, redirect url
+# https://anilist.co/api/v2/oauth/pin so AniList shows the token to paste back)
+ANILIST_CLIENT = os.environ.get("REANIME_ANILIST_CLIENT", "")
+ANILIST_LOGIN = "https://anilist.co/api/v2/oauth/authorize?client_id={}&response_type=token"
+ANILIST_MEDIA = """query ($id: Int) {
+  Media(id: $id) { episodes mediaListEntry { status progress } } }"""
+ANILIST_SAVE = """mutation ($id: Int, $progress: Int, $status: MediaListStatus) {
+  SaveMediaListEntry(mediaId: $id, progress: $progress, status: $status) { progress } }"""
+_anilist_lock = threading.Lock()
+
+
+def anilist_file():
+    return os.path.join(state_dir(), "anilist.json")
+
+
+def anilist_token():
+    """the saved AniList access token, or None when not logged in."""
+    try:
+        with open(anilist_file(), encoding="utf-8") as fh:
+            token = json.load(fh).get("token")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return token if isinstance(token, str) and token else None
+
+
+def anilist(token, query, **variables):
+    """one GraphQL request to AniList as the logged-in viewer -> its data."""
+    req = urllib.request.Request(
+        ANILIST_API, json.dumps({"query": query, "variables": variables}).encode(),
+        {**UA, "Content-Type": "application/json", "Accept": "application/json",
+         "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            reply = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            reply = json.loads(e.read().decode("utf-8"))
+        except ValueError:
+            reply = {}
+        errors = reply.get("errors") if isinstance(reply, dict) else None
+        msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else "") or ""
+        if e.code == 401 or "token" in msg.lower():
+            raise RuntimeError("your login expired or was revoked, "
+                               "run reanime --anilist again") from None
+        raise RuntimeError(msg or f"HTTP {e.code}") from None
+    errors = reply.get("errors")
+    if errors:
+        raise RuntimeError(errors[0].get("message") or "request failed")
+    return reply.get("data") or {}
+
+
+def anilist_progress(token, anime, ep):
+    """move AniList progress for anime up to ep -> what changed, or None if nothing did."""
+    n = epnum(ep)
+    if not n.isdigit() or int(n) < 1:
+        return None                     # recaps and specials numbered 12.5 aren't progress
+    n = int(n)
+    with _anilist_lock:                 # one read-then-save at a time: progress never drops
+        media = anilist(token, ANILIST_MEDIA, id=anime["anilist_id"]).get("Media") or {}
+        entry = media.get("mediaListEntry") or {}
+        if entry.get("status") == "COMPLETED" or (entry.get("progress") or 0) >= n:
+            return None
+        total = media.get("episodes")
+        status = ("COMPLETED" if total and n >= total
+                  else "REPEATING" if entry.get("status") == "REPEATING" else "CURRENT")
+        anilist(token, ANILIST_SAVE, id=anime["anilist_id"], progress=n, status=status)
+    done = "  (completed)" if status == "COMPLETED" else ""
+    return f"{title_of(anime.get('title'))} {n}{done}"
+
+
+def track(anime, ep):
+    """when logged in, move AniList progress up to ep in the background. -> a job for
+    tracked(), or None."""
+    token = anilist_token()
+    if not token or not anime.get("anilist_id"):
+        return None
+    return in_background(anilist_progress, token, anime, ep)
+
+
+def tracked(jobs, say, wait=0.0):
+    """report each job that finished (waiting up to `wait` seconds) -> the ones still running."""
+    left = []
+    for th, box in jobs:
+        th.join(wait)
+        if th.is_alive():
+            left.append((th, box))
+        elif "err" in box:
+            say(f"AniList: {box['err']}")
+        elif box.get("ok"):
+            say(f"AniList: progress {box['ok']}")
+    return left
+
+
+def anilist_login():
+    """log in to AniList: approve reanime in the browser, paste the token AniList shows."""
+    import getpass
+    import webbrowser
+    if not ANILIST_CLIENT:
+        sys.exit("AniList login isn't set up in this copy of reanime")
+    url = ANILIST_LOGIN.format(ANILIST_CLIENT)
+    print(f"1. open this link and approve reanime (it may have opened already):\n   {url}")
+    print("2. copy the token AniList shows, and paste it here (it won't show as you paste)")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass                            # no browser here: the link above is enough
+    try:
+        token = getpass.getpass("token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        token = ""
+    if not token:
+        sys.exit("no token, not logged in")
+    try:
+        name = (anilist(token, "query { Viewer { name } }").get("Viewer") or {}).get("name")
+    except (RuntimeError, OSError, ValueError) as e:
+        sys.exit(f"AniList didn't take that token: {e}")
+    os.makedirs(state_dir(), exist_ok=True)
+    fd = os.open(anilist_file(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"token": token, "user": name}, fh)
+    print(f"logged in to AniList as {name}. episodes you finish now update your progress")
+
+
+def anilist_logout():
+    try:
+        os.remove(anilist_file())
+    except FileNotFoundError:
+        print("not logged in to AniList")
+        return
+    print("logged out of AniList. to also revoke reanime's access: "
+          "https://anilist.co/settings/apps")
+
+
 # ------------------------------------------------------------------ binge sessions
 # on desktop one mpv window plays a whole binge. reanime talks to it over mpv's JSON
 # IPC and appends the next episode while the current one plays, so episodes advance
@@ -845,6 +984,11 @@ TWEAKS = ("audio-delay", "sub-scale", "sub-pos")
 POLL = 1.0       # seconds between looks at mpv's playlist position
 DONE_AT = 120    # quitting this close to the end, or once the ending starts (when the
                  # file marks it as a chapter), counts as watched
+
+
+def finished(pos, dur, ending):
+    """watched: within DONE_AT of the end, or into the ending the chapter skipper found."""
+    return pos is not None and bool((dur and dur - pos < DONE_AT) or (ending and pos >= ending))
 
 
 class MpvError(Exception):
@@ -983,7 +1127,14 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
     ending = None                     # where the ending starts, from CHAPTER_SKIPPER
     began, now = {}, {}               # TWEAKS as mpv opened, and as they are
     nxt, pending, misses = idx + 1, None, 0
+    jobs = []                         # AniList updates on their way
     ipc = mpv_connect(path, proc)
+
+    def say(msg):                     # mpv prints it to the terminal around its status line
+        try:
+            ipc.command("print-text", f"reanime: {msg}")
+        except (EOFError, OSError, ValueError, MpvError):
+            pass
     try:
         while ipc and proc.poll() is None:
             try:
@@ -999,6 +1150,9 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
                 break                           # mpv is shutting down
             if isinstance(entry, int) and 0 <= entry < len(queue):
                 if queue[entry] != cur:
+                    job = finished(pos, dur, ending) and track(anime, eps[cur])
+                    if job:                     # it played to its end, not skipped with >
+                        jobs.append(job)
                     cur, pos, dur, ending = queue[entry], None, None, None
                 if t is not None:
                     pos, dur = t, d
@@ -1020,11 +1174,9 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
                     misses = 0
                 except (LookupError, RuntimeError, OSError, ValueError, KeyError, MpvError) as e:
                     misses += 1
-                    try:
-                        ipc.command("print-text", f"reanime: skipping episode {epnum(eps[nxt])}: {e}")
-                    except (EOFError, OSError, ValueError, MpvError):
-                        pass
+                    say(f"skipping episode {epnum(eps[nxt])}: {e}")
                 nxt, pending = nxt + 1, None
+            jobs = tracked(jobs, say)
             time.sleep(POLL)
     except KeyboardInterrupt:
         status = "quit"
@@ -1042,12 +1194,14 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
             except OSError:
                 pass
 
-    watched = pos is not None and ((dur and dur - pos < DONE_AT) or (ending and pos >= ending))
+    watched = finished(pos, dur, ending)
     if ipc and status == "done" and pos is not None and not watched:
         status = "stopped"
     seconds = pos if status in ("stopped", "quit") else None
     changed = {k: round(x, 3) for k, x in now.items() if x != began[k]}
     remember(anime, eps[cur], lang, seconds, vol, changed)
+    job = watched and track(anime, eps[cur])
+    tracked(jobs + [job] if job else jobs, lambda m: sys.stderr.write(m + "\n"), wait=10)
     return cur, seconds, status
 
 
@@ -1143,6 +1297,9 @@ def play_loop(cmd, anime, eps, idx, lang):
         if choice == "quit":
             return
         if choice == "next":
+            job = got and track(anime, ep)      # moving on: count this one watched
+            if job:
+                tracked([job], lambda m: sys.stderr.write(m + "\n"), wait=10)
             idx += 1
         elif choice == "prev":
             idx -= 1
@@ -1359,6 +1516,9 @@ def main():
     ap.add_argument("--no-skip", action="store_true",
                     help="don't skip openings and endings (skipped when the file marks "
                          "them as chapters)")
+    ap.add_argument("--anilist", nargs="?", const="login", choices=("login", "logout"),
+                    help="log in to AniList, so episodes you finish update your progress "
+                         "there (--anilist logout to stop)")
     ap.add_argument("--setup", action="store_true",
                     help="find or install mpv and exit (the installers run this)")
     ap.add_argument("-y", "--yes", action="store_true",
@@ -1373,6 +1533,9 @@ def main():
         except AttributeError:
             pass
 
+    if args.anilist:
+        (anilist_login if args.anilist == "login" else anilist_logout)()
+        return
     if args.setup:
         cmd = ensure_player(args.mpv, args.yes)
         print(MPV_ANDROID_HELP if cmd is None else f"ready: {' '.join(cmd)}")
