@@ -4,6 +4,8 @@
 
 Stream anime from [reanime.to](https://reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it, then the next one, and the next, in the same window, hands-free.
 
+https://github.com/user-attachments/assets/ca87b792-9e8a-4174-9f76-7002e2994a04
+
 Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: current One Piece dub episodes (Egghead onward) that [One Pace](https://github.com/vashhdev/onepace) hasn't covered yet. Works for any show reanime has.
 
 - **One-line install** - sets up Python (if needed), reanime, and mpv for you.
