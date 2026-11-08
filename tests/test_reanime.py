@@ -764,8 +764,11 @@ class Session(unittest.TestCase):
                 mock.patch.object(reanime.MpvIpc, "command", spy), \
                 mock.patch.object(reanime, "POLL", 0.1), \
                 contextlib.redirect_stderr(io.StringIO()):
+            # --idle=yes: what mpv 0.42's mpv.exe does with no console. reanime has to
+            # override it, or mpv idles after the last episode and the session never ends
             got = reanime.play_session([*cmd, "--no-config", "--vo=null", "--ao=null",
-                                        "--really-quiet"], self.anime, self.eps, 0, "dub")
+                                        "--really-quiet", "--idle=yes"],
+                                       self.anime, self.eps, 0, "dub")
         self.assertEqual(got, (2, None, "done"))
         self.assertEqual(sent.count("loadfile"), 2)                    # 2 and 3 appended
         self.assertEqual(settings, {"audio-delay": 0.9, "sub-scale": 0.5, "sub-pos": 102})

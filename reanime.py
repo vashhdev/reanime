@@ -963,7 +963,9 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
     sys.stderr.write(f"{title}  ({lang}, {video.get('sizeHuman', '?')})\n")
 
     path = ipc_path()
-    argv = [*cmd, *mpv_args(lang), f"--input-ipc-server={path}"]
+    # --idle=no: mpv 0.42's mpv.exe started without a console (pseudo-gui) idles after
+    # the last episode instead of closing, and the session only ends when mpv does
+    argv = [*cmd, *mpv_args(lang), "--idle=no", f"--input-ipc-server={path}"]
     history = load_history()
     volume = history.get("volume")
     if isinstance(volume, (int, float)):
