@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## [1.2.1] - 2026-11-08
+
+### Fixed
+
+- **The arrow keys closed the picker on Linux and macOS** (GNOME Terminal, kitty and
+  others): the rest of the key's escape sequence sat in Python's input buffer, so the
+  arrow looked like `Esc`. Keys are now read straight from the terminal. Keys like
+  `Delete` and `Home` no longer type stray characters into the filter, and keys typed
+  quickly in a row are no longer dropped.
+- **With mpv 0.42 on Windows, mpv could stay open after the last episode** and
+  reanime waited on it: mpv 0.42 idles at the end of the playlist when it runs
+  without a console. reanime now tells mpv to close, so the menu comes back.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added

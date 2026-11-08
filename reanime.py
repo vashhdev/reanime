@@ -36,6 +36,7 @@ Interactive controls:
 """
 
 import argparse
+import codecs
 import glob
 import json
 import os
@@ -52,7 +53,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 SITE = "https://reanime.to"
 SEARCH_API = SITE + "/api/v1/search?limit=20&q={}"
@@ -119,29 +120,55 @@ def _getkey():
         if c == "\x03":
             raise KeyboardInterrupt
         return "char", c
-    # POSIX: read one char in cbreak mode (OPOST kept so \n still maps to \r\n)
+    # POSIX: read one key in cbreak mode (OPOST kept so \n still maps to \r\n)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setcbreak(fd)
-        c = sys.stdin.read(1)
-        if c == "\x1b":                  # ESC alone, or start of arrow sequence
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not r:
+        tty.setcbreak(fd, termios.TCSANOW)  # not the default TCSAFLUSH: keep keys typed ahead
+        b = _byte(fd)
+        if b == 0x1b:                    # ESC alone, or the start of an arrow key
+            b = _byte(fd, 0.05)
+            if b not in (0x5b, 0x4f):    # not "[" or "O": ESC was pressed alone
+                if b is not None:
+                    _held.insert(0, b)
                 return "key", "esc"
-            if sys.stdin.read(1) == "[":
-                c3 = sys.stdin.read(1)
-                return "key", {"A": "up", "B": "down", "C": "right", "D": "left"}.get(c3, "")
-            return "key", "esc"
-        if c in ("\r", "\n"):
+            while True:                  # parameters ("1;5" for Ctrl), then a final byte
+                b = _byte(fd, 0.05)
+                if b is None or 0x40 <= b <= 0x7e:
+                    break
+            return "key", {0x41: "up", 0x42: "down", 0x43: "right", 0x44: "left"}.get(b, "")
+        if b in (0x0d, 0x0a):
             return "key", "enter"
-        if c in ("\x7f", "\x08"):
+        if b in (0x7f, 0x08):
             return "key", "backspace"
-        if c == "\x03":
+        if b == 0x03:
             raise KeyboardInterrupt
+        decode = codecs.getincrementaldecoder(getattr(sys.stdin, "encoding", None) or "utf-8")("replace")
+        c = decode.decode(bytes([b]))
+        while not c:                     # the rest of a multi-byte character
+            b = _byte(fd, 0.05)
+            c = decode.decode(b"" if b is None else bytes([b]), final=b is None)
         return "char", c
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+_held = bytearray()                     # bytes read from the terminal, not handled yet
+
+
+def _byte(fd, wait=None):
+    """
+    next byte typed, or None if nothing arrives within `wait` seconds. reads the
+    file descriptor itself: sys.stdin's buffer would swallow the rest of an arrow
+    key's escape sequence, and select() would then report ESC pressed alone.
+    """
+    if not _held:
+        if wait is not None and not select.select([fd], [], [], wait)[0]:
+            return None
+        _held.extend(os.read(fd, 64))
+        if not _held:
+            raise EOFError
+    return _held.pop(0)
 
 
 def fuzzy_pick(items, label, header, noun="items", initial=0):
@@ -936,7 +963,9 @@ def play_session(cmd, anime, eps, idx, lang, start=0.0, stop=None):
     sys.stderr.write(f"{title}  ({lang}, {video.get('sizeHuman', '?')})\n")
 
     path = ipc_path()
-    argv = [*cmd, *mpv_args(lang), f"--input-ipc-server={path}"]
+    # --idle=no: mpv 0.42's mpv.exe started without a console (pseudo-gui) idles after
+    # the last episode instead of closing, and the session only ends when mpv does
+    argv = [*cmd, *mpv_args(lang), "--idle=no", f"--input-ipc-server={path}"]
     history = load_history()
     volume = history.get("volume")
     if isinstance(volume, (int, float)):
