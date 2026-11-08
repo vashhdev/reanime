@@ -838,8 +838,9 @@ def clock(sec):
 # episode at or below it, or anything you completed (a rewatch), is left alone.
 ANILIST_API = "https://graphql.anilist.co"
 # reanime's AniList API client (anilist.co/settings/developer, redirect url
-# https://anilist.co/api/v2/oauth/pin so AniList shows the token to paste back)
-ANILIST_CLIENT = os.environ.get("REANIME_ANILIST_CLIENT", "")
+# https://anilist.co/api/v2/oauth/pin so AniList shows the token to paste back). a
+# fork can use its own with REANIME_ANILIST_CLIENT
+ANILIST_CLIENT = os.environ.get("REANIME_ANILIST_CLIENT", "56373")
 ANILIST_LOGIN = "https://anilist.co/api/v2/oauth/authorize?client_id={}&response_type=token"
 ANILIST_MEDIA = """query ($id: Int) {
   Media(id: $id) { episodes mediaListEntry { status progress } } }"""
