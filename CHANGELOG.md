@@ -12,6 +12,9 @@ All notable changes to this project are documented here. This project follows
   entry, so nothing is matched by title. Progress only moves forward: rewatches and
   completed shows are left alone, and the last episode marks a show completed. On
   Android, choosing "next" counts the episode before it. `--anilist logout` stops it.
+- **`reanime --update`** installs the newest reanime over the one you have, with uv
+  (pip on Termux, or when uv is missing). It updates in place, so it works on Windows
+  while reanime is running. A git checkout is told to `git pull` instead.
 
 ### Changed
 

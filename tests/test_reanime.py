@@ -1201,6 +1201,71 @@ class Setup(unittest.TestCase):
             self.assertIsNone(reanime.find_mpv("/definitely/not/here/mpv"))
 
 
+class Update(unittest.TestCase):
+    """--update reinstalls from main into the environment reanime runs from."""
+
+    def update(self, layout="site", venv=True, uv="/bin/uv", new="9.0.0", fail=False, pkg=None):
+        """`reanime --update` with reanime.py in site-packages ("site"), a git checkout
+        ("git") or on its own ("file"). -> (exit code, output, commands run)"""
+        ran = []
+
+        def run(argv, **kw):
+            ran.append(argv)
+            if "-c" in argv:                            # asking the new reanime its version
+                return subprocess.CompletedProcess(argv, 0, stdout=new + "\n")
+            return subprocess.CompletedProcess(argv, 1 if fail else 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            if layout == "git":
+                os.mkdir(os.path.join(tmp, ".git"))
+            site = tmp if layout == "site" else os.path.join(tmp, "site-packages")
+            with mock.patch.object(reanime, "__file__", os.path.join(tmp, "reanime.py")), \
+                    mock.patch.object(reanime.sysconfig, "get_paths",
+                                      lambda: {"purelib": site, "platlib": site}), \
+                    mock.patch.object(reanime.sys, "prefix", "/venv" if venv else "/usr"), \
+                    mock.patch.object(reanime.sys, "base_prefix", "/usr"), \
+                    mock.patch.object(reanime.shutil, "which", lambda c: uv if c == "uv" else None), \
+                    mock.patch.object(reanime.subprocess, "run", run), \
+                    mock.patch.dict(os.environ):
+                os.environ.pop("REANIME_PKG", None)
+                if pkg:
+                    os.environ["REANIME_PKG"] = pkg
+                code, out, err = run_main("--update")
+        return code, out + err, ran
+
+    def test_a_uv_tool_or_pipx_venv_is_reinstalled_in_place(self):
+        # in place with uv pip: `uv tool install --force` deletes the venv first, and
+        # Windows can't delete the python.exe running reanime
+        code, out, ran = self.update()
+        self.assertEqual(ran[0], ["/bin/uv", "pip", "install", "--python", sys.executable,
+                                  "--reinstall", reanime.PACKAGE])
+        self.assertIn("-I", ran[1])                     # not a reanime.py in this folder
+        self.assertIn(f"updated reanime {reanime.__version__} -> 9.0.0", out)
+        self.assertFalse(code)
+        self.assertIn("already the newest", self.update(new=reanime.__version__)[1])
+
+    def test_termux_or_no_uv_uses_pip_like_the_installer(self):
+        pip = [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall"]
+        self.assertEqual(self.update(venv=False)[2][0], pip + [reanime.PACKAGE])
+        self.assertEqual(self.update(uv=None)[2][0], pip + [reanime.PACKAGE])
+        self.assertEqual(self.update(pkg="/tmp/reanime.whl")[2][0][-1], "/tmp/reanime.whl")
+
+    def test_a_failed_update_says_to_run_the_installer(self):
+        code, _, ran = self.update(fail=True)
+        self.assertIn("update failed", code)
+        self.assertIn(reanime.INSTALLER, code)
+        self.assertEqual(len(ran), 1)
+        self.assertIn("doesn't start", self.update(new="")[0])
+
+    def test_a_git_checkout_or_a_single_file_is_left_alone(self):
+        code, _, ran = self.update("git")
+        self.assertIn("git pull", code)
+        self.assertEqual(ran, [])
+        code, _, ran = self.update("file")
+        self.assertIn("single file", code)
+        self.assertIn(reanime.INSTALLER, code)
+        self.assertEqual(ran, [])
+
+
 class Android(unittest.TestCase):
     def test_no_mpv_needed_and_setup_points_to_app(self):
         with mock.patch.object(reanime, "ANDROID", True):
