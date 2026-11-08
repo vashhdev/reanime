@@ -16,6 +16,7 @@ Built for the gap [ani-cli](https://github.com/pystardust/ani-cli) leaves: curre
 - **Skips openings and endings** - when the file marks them as chapters, mpv jumps past the opening, and past the ending and preview into the next episode (stopping for an extra like Jujutsu Kaisen's Juju Stroll). `Tab` skips by hand, one key, no `Fn`.
 - **Picks up where you left off** - quit mid-episode and `Enter` resumes it. Plain `reanime` offers "continue ONE PIECE 1155 at 12:34", and mpv reopens at your last volume.
 - **Remembers your fixes per show** - an audio delay, subtitle size or subtitle position you set in mpv sticks to that show, for dub and sub separately.
+- **AniList tracking (optional)** - log in once with `reanime --anilist` and every episode you finish updates your progress on [AniList](https://anilist.co).
 - **Ranges** - `1151-1160` plays exactly those, back to back.
 
 ## Install
@@ -98,6 +99,7 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | `--m3u [PATH]`  | write an `.m3u` playlist instead. Links expire after 6 hours and only work from your current network |
 | `--mpv PATH`    | path to the mpv binary (default: found automatically)             |
 | `--no-skip`     | play openings and endings instead of skipping them                |
+| `--anilist`     | log in to AniList so finished episodes update your progress (`--anilist logout` to stop) |
 | `--setup`       | find or install mpv, then exit                                    |
 | `-y`, `--yes`   | install mpv without asking if it's missing (scripts, CI)          |
 
@@ -112,6 +114,21 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 - Some releases need fixing by hand: Jujutsu Kaisen's dub is 0.9s early, its subtitles huge. Whatever you change in mpv for a show is saved when mpv closes and set again next time, for dub and sub separately: the audio delay (`Ctrl +` / `Ctrl -`), subtitle size (`F` / `G`) and subtitle position (`r` / `R`). reanime prints them when it applies them; change one back in mpv to undo it.
 - Where you left off is kept in `%APPDATA%\reanime\history.json` on Windows (`~/Library/Application Support/reanime` on macOS, `~/.local/state/reanime` on Linux). Delete it to forget everything.
 - **mpv-android:** the app picks the audio and subtitle tracks itself. For dub-by-default, add `alang=eng` under Settings > Advanced > Edit mpv.conf. If a sub episode only shows the episode title, switch to the "Full Subtitles" track from the subtitle button.
+
+### AniList
+
+Tracking is off until you log in:
+
+```bash
+reanime --anilist           # opens AniList in your browser: approve, then paste the token it shows
+reanime --anilist logout    # stop tracking
+```
+
+After that, every episode you finish sets your progress on that show, with no setup per show: reanime.to already says which AniList entry each show is. An episode counts as finished the same way it does for resuming: played to within 2 minutes of the end, or into the ending. Skipping past one with `>` doesn't count. On Android, where mpv-android can't report back, choosing **next** counts the episode you just opened.
+
+Progress only moves forward. Rewatching an episode before your progress, or a show you've completed, changes nothing. A show you've marked as rewatching keeps that status, and the last episode marks a show completed. reanime prints what it updated, like `AniList: progress JUJUTSU KAISEN 5`.
+
+The token stays on your computer, next to your watch history. To also remove reanime's access on AniList's side, go to [your AniList apps](https://anilist.co/settings/apps).
 
 ## How it works
 
