@@ -62,6 +62,10 @@ Or just grab the single file and run `python reanime.py`. It works without insta
 | Android | [mpv-android](https://github.com/mpv-android/mpv-android) app | install it yourself from Google Play or F-Droid; reanime runs in [Termux](https://termux.dev) and opens each episode in the app |
 | iOS | none | `--print` the link and open it in VLC or Outplayer |
 
+On Android, reanime runs in Termux and hands each episode to mpv-android:
+
+https://github.com/user-attachments/assets/65a62f16-a674-4736-8184-ef45a566b511
+
 ## Usage
 
 ```bash
