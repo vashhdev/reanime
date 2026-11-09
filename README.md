@@ -39,7 +39,7 @@ The installer:
 2. installs reanime as a global `reanime` command,
 3. runs `reanime --setup`, which finds mpv or offers to install it with your system's package manager.
 
-Run the same command again any time to update. Then open a new terminal and run `reanime`.
+Then open a new terminal and run `reanime`. To update later, run `reanime --update` (or the same command again).
 
 ### Manual install
 
@@ -102,6 +102,7 @@ reanime "one piece" 1151 --dub --print    # print the stream url instead of play
 | `--anilist`     | log in to AniList so finished episodes update your progress (`--anilist logout` to stop) |
 | `--setup`       | find or install mpv, then exit                                    |
 | `-y`, `--yes`   | install mpv without asking if it's missing (scripts, CI)          |
+| `--update`      | update reanime to the newest version (a git checkout says to `git pull` instead) |
 
 ### mpv tips
 

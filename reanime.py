@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.error
@@ -1496,6 +1497,46 @@ def watch(cmd, anime, eps, idx, lang, start=0.0, stop=None):
         binge(cmd, anime, eps, idx, lang, start, stop)
 
 
+# what the one-line installers install, and how to run them again
+PACKAGE = "reanime-mpv @ https://github.com/vashhdev/reanime/archive/refs/heads/main.zip"
+INSTALLER = ("irm https://raw.githubusercontent.com/vashhdev/reanime/main/install.ps1 | iex"
+             if os.name == "nt" else
+             "curl -fsSL https://raw.githubusercontent.com/vashhdev/reanime/main/install.sh | sh")
+
+
+def update():
+    """reinstall reanime from main into the environment this copy runs from: uv when
+    it's a venv (uv tool, pipx), else pip (Termux, like its installer). not the
+    installers' `uv tool install --force`: that deletes the venv first, and Windows
+    won't delete the python.exe running this. a git checkout or a lone reanime.py is
+    left to you."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = sysconfig.get_paths()
+    if os.path.normcase(here) not in {os.path.normcase(os.path.abspath(paths[k]))
+                                      for k in ("purelib", "platlib")}:
+        if os.path.isdir(os.path.join(here, ".git")):
+            sys.exit(f"this reanime runs from a git checkout ({here}): update it with git pull")
+        sys.exit(f"this reanime is a single file ({os.path.abspath(__file__)}), which --update "
+                 f"can't replace. install it with:\n  {INSTALLER}")
+    pkg = os.environ.get("REANIME_PKG") or PACKAGE      # like the installers
+    uv = shutil.which("uv")
+    if uv and sys.prefix != sys.base_prefix:
+        argv = [uv, "pip", "install", "--python", sys.executable, "--reinstall", pkg]
+    else:
+        argv = [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", pkg]
+    sys.stderr.write(f"updating reanime {__version__}: {' '.join(argv)}\n")
+    if subprocess.run(argv).returncode:
+        sys.exit(f"update failed. run the installer again:\n  {INSTALLER}")
+    # -I: not a reanime.py in the current folder
+    new = subprocess.run([sys.executable, "-I", "-c", "import reanime; print(reanime.__version__)"],
+                         capture_output=True, text=True).stdout.strip()
+    if not new:
+        sys.exit(f"the update installed, but the new reanime doesn't start. run the installer "
+                 f"again:\n  {INSTALLER}")
+    print(f"reanime {new}: already the newest" if new == __version__
+          else f"updated reanime {__version__} -> {new}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="stream anime from reanime.to in mpv")
     ap.add_argument("anime", nargs="?",
@@ -1524,6 +1565,8 @@ def main():
                     help="find or install mpv and exit (the installers run this)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="install mpv without asking if it is missing (scripts, CI)")
+    ap.add_argument("--update", action="store_true",
+                    help="update reanime to the newest version and exit")
     ap.add_argument("--version", action="version", version=f"reanime {__version__}")
     args = ap.parse_args()
 
@@ -1540,6 +1583,9 @@ def main():
     if args.setup:
         cmd = ensure_player(args.mpv, args.yes)
         print(MPV_ANDROID_HELP if cmd is None else f"ready: {' '.join(cmd)}")
+        return
+    if args.update:
+        update()
         return
     # check the player before any searching, so a first run sets everything up front
     playing = not (args.list or args.print_only or args.m3u is not None)
