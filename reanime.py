@@ -1649,6 +1649,10 @@ def main():
             sys.stderr.write(f"resuming at {clock(start)}\n")
 
     if args.print_only or args.m3u is not None:
+        if args.m3u:
+            m3u_parent = os.path.dirname(os.path.abspath(args.m3u))
+            if not os.path.isdir(m3u_parent):
+                sys.exit(f"no such directory for --m3u: {m3u_parent}")
         resolved = resolve_many(anime, [avail[i] for i in picked], lang)
         if not resolved:
             sys.exit("nothing to play")

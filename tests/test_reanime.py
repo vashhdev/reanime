@@ -360,6 +360,17 @@ class Main(unittest.TestCase):
             code, _, _ = run_main("one piece", "1180", "--dub", "--print")
         self.assertIn("no dub release", str(code))
 
+    def test_m3u_missing_directory_exits_cleanly(self):
+        with offline() as opened, tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "no-such-dir", "out.m3u")
+            code, out, err = run_main("one piece", "1150", "--dub", "--m3u", path)
+            self.assertNotEqual(code, 0)
+            self.assertIn("no such directory", str(code))
+            self.assertNotIn("Traceback", out + err)
+            # fails fast: no stream is resolved before the directory check
+            self.assertEqual(opened, [])
+        self.assertFalse(os.path.exists(path))
+
     def test_setup_reports_player(self):
         with mock.patch.object(reanime, "find_mpv", return_value=["/usr/bin/mpv"]):
             code, out, _ = run_main("--setup")
