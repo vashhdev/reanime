@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-reanime.py - stream anime from reanime.to in mpv, English dubs included.
+reanime.py - stream anime from reanime.cz (formerly reanime.to) in mpv, English dubs included.
 
 Pipeline:
-  1. search https://reanime.to/api/v1/search -> anime slug
+  1. search https://reanime.cz/api/v1/search -> anime slug
   2. fetch /watch/<slug>/__data.json -> anilist/mal ids + episode list with sub/dub flags
   3. fetch /api/flix/<anilist id>/<episode> -> flixcloud file id of the sub or dub server
   4. fetch https://flixcloud.cc/d/<id>/__data.json -> download token, wait until
@@ -20,7 +20,7 @@ Usage:
   python reanime.py "one piece" 1151 --dub             # play 1151, then a next/replay/prev menu
   python reanime.py "one piece" 1151-1160 --dub        # one mpv playlist of the whole range
   python reanime.py "one piece" 1151- --dub            # 1151 through the newest episode
-  python reanime.py "https://reanime.to/watch/one-piece-xamk74?ep=1151&lang=dub"
+  python reanime.py "https://reanime.cz/watch/one-piece-xamk74?ep=1151&lang=dub"
   python reanime.py one-piece-xamk74 --list            # print every episode then exit
   python reanime.py "one piece" 1151 --dub --print     # print the stream url, don't launch mpv
   python reanime.py --setup                            # find or install mpv, then exit
@@ -54,9 +54,10 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
-SITE = "https://reanime.to"
+# the site moved here from reanime.to on 2026-11-12. fetch() follows another move like it
+SITE = "https://reanime.cz"
 SEARCH_API = SITE + "/api/v1/search?limit=20&q={}"
 WATCH_DATA = SITE + "/watch/{}/__data.json?ep=1"
 FLIX_API = SITE + "/api/flix/{}/{}"
@@ -68,7 +69,8 @@ LANGS = {"sub": ("sub", "s-sub"), "dub": ("dub", "s-dub")}
 FLAG = {"sub": "subbed", "dub": "dubbed"}
 LANG_LABEL = {"dub": "English Dub", "sub": "Japanese audio, English subs"}
 
-URL_RE = re.compile(r"reanime\.to/(?:watch|anime)/([A-Za-z0-9-]+)")
+# a pasted link: reanime.cz, or an old reanime.to one
+URL_RE = re.compile(r"reanime\.[a-z]+/(?:watch|anime)/([A-Za-z0-9-]+)")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 EMBED_RE = re.compile(r"flixcloud\.cc/e/([A-Za-z0-9]+)")
 
@@ -277,12 +279,18 @@ def _fallback_pick(items, label, header):
     return hits[int(raw) - 1] if raw else hits[0]
 
 
-# ------------------------------------------------------------------ reanime.to
+# ------------------------------------------------------------------ reanime.cz
 
-def fetch(url):
+def fetch(url, moved=False):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", "replace")
+        body, got = r.read().decode("utf-8", "replace"), urllib.parse.urlsplit(r.geturl())
+    asked, home = urllib.parse.urlsplit(url), ("", "/")
+    if not moved and got.netloc != asked.netloc and got.path in home and asked.path not in home:
+        # the site moved, and its old domain sends every page to the new homepage
+        # (reanime.to -> reanime.cz/): ask the new domain for the same page
+        return fetch(urllib.parse.urlunsplit(asked._replace(scheme=got.scheme, netloc=got.netloc)), True)
+    return body
 
 
 def devalue(data):
@@ -365,7 +373,7 @@ def load_anime(slug):
 
 
 def parse_url(s):
-    """reanime.to watch/anime url -> (slug, ep, lang), anything else -> (None, None, None)."""
+    """reanime.cz/.to watch/anime url -> (slug, ep, lang), anything else -> (None, None, None)."""
     m = URL_RE.search(s)
     if not m:
         return None, None, None
@@ -834,7 +842,7 @@ def clock(sec):
 
 # ------------------------------------------------------------------ AniList
 # opt-in progress tracking. `reanime --anilist` logs in once; from then on every
-# episode you finish moves your AniList progress up to it. reanime.to already names
+# episode you finish moves your AniList progress up to it. the site already names
 # each show's AniList entry, so there is no title matching. progress only goes up: an
 # episode at or below it, or anything you completed (a rewatch), is left alone.
 ANILIST_API = "https://graphql.anilist.co"
@@ -1537,10 +1545,10 @@ def update():
           else f"updated reanime {__version__} -> {new}")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="stream anime from reanime.to in mpv")
+def run():
+    ap = argparse.ArgumentParser(description="stream anime from reanime.cz in mpv")
     ap.add_argument("anime", nargs="?",
-                    help="search text, a reanime slug (one-piece-xamk74), or a reanime.to url")
+                    help="search text, a reanime slug (one-piece-xamk74), or a reanime.cz url")
     ap.add_argument("episode", nargs="?",
                     help="episode or range: 1151, 1151-1160, 1151- (through the newest)")
     lang_flag = ap.add_mutually_exclusive_group()
@@ -1666,13 +1674,19 @@ def main():
     watch(cmd, anime, avail, picked[0], lang, start, picked[-1] if is_range else None)
 
 
-if __name__ == "__main__":
+def main():
+    """the reanime command, installed or as python reanime.py: errors you can act on end
+    in one line, not a traceback."""
     try:
-        main()
+        run()
     except KeyboardInterrupt:
         sys.exit("\ncancelled")
     except (urllib.error.URLError, TimeoutError) as e:
         sys.exit(f"network error: {e}")
     except ValueError as e:
-        sys.exit(f"unexpected response from reanime/flixcloud (site changed or "
-                 f"Cloudflare check?): {e}")
+        sys.exit(f"unexpected response from reanime/flixcloud (site changed or Cloudflare "
+                 f"check?): {e}\nreanime --update gets the newest reanime")
+
+
+if __name__ == "__main__":
+    main()
