@@ -5,7 +5,7 @@ offline tests for reanime.py: no network, stdlib only.
 
 the site is replaced by fixtures shaped like the real responses (SvelteKit
 __data.json in devalue encoding, the flix server list, flixcloud's prepare-progress
-event stream), so every step of the pipeline runs without touching reanime.to.
+event stream), so every step of the pipeline runs without touching reanime.cz.
 three tests drive a real mpv when one is installed (the sub picker, a whole binge
 session, the chapter skipper), and are skipped otherwise.
 """
@@ -91,20 +91,20 @@ TOKEN = "eyJ.a+b/c="                    # needs url-quoting: + / =
 FILE_URL = "https://fetch8.flixcloud.cc/download/7622-uuid?token=eyJ.a%2Bb%2Fc%3D"
 
 URLS = {
-    "https://reanime.to/api/v1/search?limit=20&q=one%20piece": json.dumps({"results": [
+    f"{reanime.SITE}/api/v1/search?limit=20&q=one%20piece": json.dumps({"results": [
         {"anime_id": "one-piece-film-red-yuq2kp", "title": {"english": "One Piece Film: Red"},
          "format": "MOVIE"},
         {"anime_id": "one-piece-xamk74", "title": {"english": "ONE PIECE", "romaji": "ONE PIECE"},
          "format": "TV", "season_year": 1999, "dubbed": 1157},
     ]}),
-    "https://reanime.to/watch/one-piece-xamk74/__data.json?ep=1":
+    f"{reanime.SITE}/watch/one-piece-xamk74/__data.json?ep=1":
         svelte({"sessionUser": None, "isAuthed": False}, None, {"anime": ANIME, "episodes": EPISODES}),
     "https://flixcloud.cc/d/gfa1lt2dzeev/__data.json":
         svelte(None, {"video": {"fileId": "7622-uuid", "filename": "ep.mkv", "sizeHuman": "940 MB"},
                       "download": {"base": "https://fetch8.flixcloud.cc", "token": TOKEN}}),
 }
 for _n in (1150, 1151, 1152):
-    URLS[f"https://reanime.to/api/flix/21/{_n}?mal=21"] = SERVERS
+    URLS[f"{reanime.SITE}/api/flix/21/{_n}?mal=21"] = SERVERS
 
 
 def read(path):
@@ -226,12 +226,53 @@ class Parsing(unittest.TestCase):
 
     def test_page_data_picks_the_node_with_the_key(self):
         with offline():
-            d = reanime.page_data("https://reanime.to/watch/one-piece-xamk74/__data.json?ep=1", "anime")
+            d = reanime.page_data(f"{reanime.SITE}/watch/one-piece-xamk74/__data.json?ep=1", "anime")
         self.assertEqual(d["anime"]["anilist_id"], 21)
         self.assertEqual(len(d["episodes"]), 4)
 
+    def test_fetch_follows_the_site_to_a_new_domain(self):
+        """reanime.to now answers every page with a redirect to reanime.cz's homepage."""
+        asked = []
+
+        class Response(io.BytesIO):
+            def __init__(self, url, body):
+                super().__init__(body.encode())
+                self.url = url
+
+            def geturl(self):
+                return self.url
+
+        moves = {"https://old.example": "https://new.example/",       # the site moved
+                 "https://hop1.example": "https://hop2.example/",     # and moved on again
+                 "https://hop2.example": "https://hop3.example/"}
+
+        def urlopen(req, timeout=None):
+            url = req.full_url
+            asked.append(url)
+            origin = "/".join(url.split("/")[:3])
+            if origin in moves:
+                return Response(moves[origin], "<!doctype html>")
+            if url == "https://new.example/x/":
+                return Response("https://new.example/y/", "moved within the site")
+            return Response(url, '{"ok": 1}')
+
+        with mock.patch.object(reanime.urllib.request, "urlopen", urlopen):
+            self.assertEqual(reanime.fetch("https://old.example/a/b?c=1"), '{"ok": 1}')
+            self.assertEqual(asked, ["https://old.example/a/b?c=1", "https://new.example/a/b?c=1"])
+            # a redirect to another page of the same site is just followed
+            self.assertEqual(reanime.fetch("https://new.example/x/"), "moved within the site")
+            # asking for the homepage gets the homepage
+            self.assertEqual(reanime.fetch("https://old.example/"), "<!doctype html>")
+            # the new domain is asked once, not followed on to a third
+            del asked[:]
+            self.assertEqual(reanime.fetch("https://hop1.example/a"), "<!doctype html>")
+            self.assertEqual(asked, ["https://hop1.example/a", "https://hop2.example/a"])
+
     def test_parse_url(self):
         self.assertEqual(reanime.parse_url(
+            "https://reanime.cz/watch/one-piece-xamk74?ep=1151&lang=dub&server=HD-2"),
+            ("one-piece-xamk74", "1151", "dub"))
+        self.assertEqual(reanime.parse_url(          # a link from before the move
             "https://reanime.to/watch/one-piece-xamk74?ep=1151&lang=dub&server=HD-2"),
             ("one-piece-xamk74", "1151", "dub"))
         self.assertEqual(reanime.parse_url("https://reanime.to/anime/one-piece-xamk74"),
@@ -280,8 +321,8 @@ class Pipeline(unittest.TestCase):
             self.assertEqual(reanime.servers(ANIME, {"number": 1151}), [1])
             reanime.servers({"themoviedb_id": 99, "external_seasons": {"tmdb": 2}}, {"number": 4})
             self.assertEqual(reanime.servers({}, {"number": 1}), [])
-        self.assertEqual(calls, ["https://reanime.to/api/flix/21/1151?mal=21",
-                                 "https://reanime.to/api/flix/0/4?tmdb=99&season=2"])
+        self.assertEqual(calls, [f"{reanime.SITE}/api/flix/21/1151?mal=21",
+                                 f"{reanime.SITE}/api/flix/0/4?tmdb=99&season=2"])
 
     def test_resolve_builds_quoted_download_url(self):
         with offline() as opened:
@@ -309,7 +350,7 @@ class Pipeline(unittest.TestCase):
 
     def test_resolve_without_language_source(self):
         sub_only = json.dumps({"success": True, "servers": json.loads(SERVERS)["servers"][:1]})
-        with offline(), mock.patch.dict(URLS, {"https://reanime.to/api/flix/21/1151?mal=21": sub_only}):
+        with offline(), mock.patch.dict(URLS, {f"{reanime.SITE}/api/flix/21/1151?mal=21": sub_only}):
             with self.assertRaisesRegex(LookupError, "no dub source"):
                 reanime.resolve(ANIME, EPISODES[1], "dub")
 
@@ -338,6 +379,22 @@ class Main(unittest.TestCase):
                                       "--print")
         self.assertEqual(code, 0, err)
         self.assertEqual(out.split(), [FILE_URL] * 3)
+
+    def test_the_installed_command_ends_in_one_line_not_a_traceback(self):
+        """the reanime command calls main(), so main() itself turns these into a message
+        (a web page where the data should be is what the move to reanime.cz caused)."""
+        for raised, said in [(None, "unexpected response from reanime/flixcloud"),
+                             (None, "reanime --update gets the newest reanime"),
+                             (urllib.error.URLError("no route"), "network error: <urlopen error no route>"),
+                             (KeyboardInterrupt(), "cancelled")]:
+            def fetch(url, raised=raised):
+                if raised:
+                    raise raised
+                return "<!doctype html>\n<html>"
+            with mock.patch.object(reanime, "fetch", fetch):
+                code, out, err = run_main("one-piece-xamk74", "--list")
+            self.assertIsInstance(code, str)
+            self.assertIn(said, code)
 
     def test_list(self):
         with offline():

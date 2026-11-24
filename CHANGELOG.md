@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## [1.3.1] - 2026-11-12
+
+### Fixed
+
+- **reanime stopped working: the site moved to reanime.cz.** reanime.to now sends
+  every page to reanime.cz's homepage, so reanime got a web page where it expected
+  data and crashed (`JSONDecodeError: Expecting value`). reanime now uses reanime.cz.
+  If the site moves again the same way, reanime follows it to the new domain.
+  Links pasted from either domain work.
+- The installed `reanime` command showed a Python traceback for network errors, an
+  unexpected response from the site, or `Ctrl+C`. It now prints one line, as
+  `python reanime.py` already did, and suggests `reanime --update` when the site has
+  changed.
+
 ## [1.3.0] - 2026-11-08
 
 ### Added

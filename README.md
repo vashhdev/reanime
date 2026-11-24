@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/vashhdev/reanime/actions/workflows/ci.yml/badge.svg)](https://github.com/vashhdev/reanime/actions/workflows/ci.yml)
 
-Stream anime from [reanime.to](https://reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it, then the next one, and the next, in the same window, hands-free.
+Stream anime from [reanime.cz](https://reanime.cz) (formerly reanime.to) straight into [mpv](https://mpv.io), **English dubs included**. Search for a show, pick dub or sub, pick an episode with a fuzzy arrow-key picker, and mpv plays it, then the next one, and the next, in the same window, hands-free.
 
 https://github.com/user-attachments/assets/ca87b792-9e8a-4174-9f76-7002e2994a04
 
@@ -75,7 +75,7 @@ reanime "one piece"                       # skip the search prompt
 reanime "one piece" 1151 --dub            # play 1151, 1152, 1153... until you quit
 reanime "one piece" 1151-1160 --dub       # play just this range
 reanime "one piece" 1151- --dub           # 1151 through the newest dub
-reanime "https://reanime.to/watch/one-piece-xamk74?ep=1151&lang=dub"   # paste a url from the site
+reanime "https://reanime.cz/watch/one-piece-xamk74?ep=1151&lang=dub"   # paste a url from the site
 reanime one-piece-xamk74 --list           # every episode: S/D availability, filler tags
 reanime "one piece" 1151 --dub --print    # print the stream url instead of playing
 ```
@@ -125,7 +125,7 @@ reanime --anilist           # opens AniList in your browser: approve, then paste
 reanime --anilist logout    # stop tracking
 ```
 
-After that, every episode you finish sets your progress on that show, with no setup per show: reanime.to already says which AniList entry each show is. An episode counts as finished the same way it does for resuming: played to within 2 minutes of the end, or into the ending. Skipping past one with `>` doesn't count. On Android, where mpv-android can't report back, choosing **next** counts the episode you just opened.
+After that, every episode you finish sets your progress on that show, with no setup per show: reanime.cz already says which AniList entry each show is. An episode counts as finished the same way it does for resuming: played to within 2 minutes of the end, or into the ending. Skipping past one with `>` doesn't count. On Android, where mpv-android can't report back, choosing **next** counts the episode you just opened.
 
 Progress only moves forward. Rewatching an episode before your progress, or a show you've completed, changes nothing. A show you've marked as rewatching keeps that status, and the last episode marks a show completed. reanime prints what it updated, like `AniList: progress JUJUTSU KAISEN 5`.
 
@@ -157,7 +157,7 @@ Every push and pull request runs the [CI pipeline](.github/workflows/ci.yml) in 
 | 2 · test | the offline suite on Windows, macOS and Linux, with Python 3.8 and 3.13 |
 | 3 · build | the package builds and its metadata is valid |
 | 4 · install | the real one-line installers on fresh Windows, macOS and Linux machines: uv, reanime, mpv through the system package manager, then mpv plays a test clip. Termux runs in Docker as an experimental job |
-| 5 · live | reanime.to and flixcloud still work: search, episode list, and mpv opens real episodes, picking the English track on a dub |
+| 5 · live | reanime.cz and flixcloud still work: search, episode list, and mpv opens real episodes, picking the English track on a dub |
 | 6 · release | on a `v*` tag: checks the tag matches the version, then publishes a GitHub release with the changelog notes |
 
 The pipeline also runs daily, so if reanime changes something, the **live** stage fails.
@@ -168,7 +168,7 @@ To release: bump `__version__` in `reanime.py` and `version` in `pyproject.toml`
 
 ## Disclaimer
 
-reanime.to is an unofficial streaming site, and this tool only automates what its own pages and flixcloud's download page already do in a browser. It hosts nothing. If you can, support the official releases (One Piece streams on Crunchyroll and Netflix). You are responsible for how you use this software and for complying with the terms of the services it talks to.
+reanime.cz is an unofficial streaming site, and this tool only automates what its own pages and flixcloud's download page already do in a browser. It hosts nothing. If you can, support the official releases (One Piece streams on Crunchyroll and Netflix). You are responsible for how you use this software and for complying with the terms of the services it talks to.
 
 ## License
 
